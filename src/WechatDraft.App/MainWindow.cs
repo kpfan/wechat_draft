@@ -17,6 +17,7 @@ public sealed partial class MainWindow : Window
     private readonly CompatibleModelClient _client = new();
     private readonly TaskCoordinator _coordinator;
     private readonly ContentControl _page = new() { HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch };
+    private HistoryPageView? _historyView;
     private readonly TextBlock _footer = Ui.Text("Ctrl + Alt + B", 12, "71817B");
     private readonly List<Button> _navigation = [];
     private AppSettings _settings;
@@ -81,7 +82,7 @@ public sealed partial class MainWindow : Window
         if (!_hotkey.Register(_settings.HotkeyVirtualKey)) _footer.Text = "快捷键冲突，请到设置修改";
         SetupTray();
         ConfigureWindowRefresh();
-        Closed += (_, _) => { _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
+        Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
     }
 
     private void SeedDemoContacts()
@@ -132,6 +133,7 @@ public sealed partial class MainWindow : Window
 
     private void SelectNavigation(string pageName)
     {
+        _historyView?.Dispose(); _historyView = null;
         _homeVisible = pageName == nameof(ShowHome);
         if (_homeVisible && !IsTaskBusy) _taskFinishedElsewhere = false;
         _idleActions.Clear();
@@ -401,6 +403,7 @@ public sealed partial class MainWindow : Window
         if (_windows is not null) _windows.IsEnabled = !busy;
         if (_mode is not null) _mode.IsEnabled = !busy;
         foreach (var button in _idleActions) button.IsEnabled = !busy;
+        _historyView?.SetTaskBusy(busy);
         if (!busy) _taskFinishedElsewhere = !_homeVisible;
         RefreshSidebarTask();
         if (!busy)

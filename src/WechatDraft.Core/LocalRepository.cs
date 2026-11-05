@@ -20,6 +20,7 @@ public sealed class LocalRepository
             CREATE TABLE IF NOT EXISTS contacts (id TEXT PRIMARY KEY, scope TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS tasks (id TEXT PRIMARY KEY, scope TEXT NOT NULL, created TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS tasks_created ON tasks(created DESC);
+            CREATE INDEX IF NOT EXISTS tasks_scope_created_id ON tasks(scope, created DESC, id DESC);
             CREATE TABLE IF NOT EXISTS sent_greetings (id TEXT PRIMARY KEY, scope TEXT NOT NULL, created TEXT NOT NULL, payload TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS sent_greetings_created ON sent_greetings(created DESC);
             PRAGMA user_version=1;
@@ -71,6 +72,28 @@ public sealed class LocalRepository
     public List<TaskRecord> History(string? scope, int limit = 200) => Read<TaskRecord>(scope is null
         ? "SELECT payload FROM tasks ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000)
         : "SELECT payload FROM tasks WHERE scope=$scope ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000), scope);
+    public HistoryBatch ReadHistoryBatch(string scope, HistoryCursor? before, int limit, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        limit = Math.Clamp(limit, 1, 200);
+        using var db = Open(); using var command = db.CreateCommand();
+        command.CommandText = before is null
+            ? "SELECT id,created,payload FROM tasks WHERE scope=$scope ORDER BY created DESC,id DESC LIMIT $limit"
+            : "SELECT id,created,payload FROM tasks WHERE scope=$scope AND (created < $created OR (created=$created AND id < $id)) ORDER BY created DESC,id DESC LIMIT $limit";
+        command.Parameters.AddWithValue("$scope", scope); command.Parameters.AddWithValue("$limit", limit + 1);
+        if (before is not null)
+        { command.Parameters.AddWithValue("$created", before.Created); command.Parameters.AddWithValue("$id", before.Id); }
+        using var reader = command.ExecuteReader();
+        var records = new List<TaskRecord>(); HistoryCursor? cursor = before;
+        while (reader.Read())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (records.Count == limit) return new(records, cursor, true);
+            records.Add(Decode<TaskRecord>(reader.GetString(2)));
+            cursor = new(reader.GetString(1), reader.GetString(0));
+        }
+        return new(records, cursor, false);
+    }
     public void DeleteTask(string id) => Write("DELETE FROM tasks WHERE id=$id", ("$id", id));
     public void ClearHistory() => Write("DELETE FROM tasks");
     public void SaveSentGreeting(SentGreetingRecord record) => Write(

@@ -29,6 +29,7 @@ var settings = new AppSettings { Scene = "生日", DemoMode = true };
 foreach (var (name, run) in ApiProfileChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in SentGreetingChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in ExampleChecks.Cases(examplePath)) await Test(name, run);
+foreach (var (name, run) in HistorySearchChecks.Cases(root, protector)) await Test(name, run);
 LocalRepository ContactRepository() => new(Path.Combine(root, "contacts-" + Guid.NewGuid().ToString("N")), protector);
 AppSettings RealSettings() => settings with { DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
 AddressEvidence ChatAddress(string quote, string captureId = "capture_0") => new() { Source = "chat_message", Speaker = "self", Quote = quote, CaptureId = captureId };

@@ -254,6 +254,16 @@ SQLite 文件为 `drafts.db`，包含 `settings`、`contacts`、`tasks`、`sent_
 
 完整原始草稿不写入任务历史，截图也不主动落盘。历史默认保留 90 天，配置为 0 时留到手动清理；联系人档案单独管理。
 
+### 历史页读取与列表性能
+
+`HistoryPageView` 使用编译 XAML 的 `ListView` / `ItemsStackPanel`，直接放在剩余高度为 `*` 的 Grid 行中，不再套用主窗口的外层 ScrollViewer。列表只实现附近条目的容器，详情合并到可展开区域；`HistoryItem` 保存展示数据和绑定到该条记录的命令，不在 `_idleActions` 中长期保留每个列表按钮。[Microsoft 的 ListView 文档](https://learn.microsoft.com/en-us/windows/apps/develop/ui/controls/listview-and-gridview)说明该面板支持虚拟化；有界布局与数据分页配合使用。
+
+SQLite 增加 `(scope, created DESC, id DESC)` 组合索引，不增加业务表或明文搜索字段。`ReadHistoryBatch` 通过时间及 ID 游标分页，用参数限定工作区，时间相同时仍稳定排序，不使用随列表增长的 OFFSET；读取时逐条检查取消。既有 `History` 接口仍供恢复、删除联系人关联和其他业务调用使用。
+
+`HistorySearchSession` 在 `Task.Run` 中通过信号量串行访问页面缓存，按 64 条扫描 DPAPI 加密记录，记录只有被读取时才解密，并缓存对应搜索文本；一次返回 40 条匹配结果及是否还有下一页。查不到或匹配较远时继续扫描本工作区；后续关键词复用已读记录，不反复解密。取消的半批次不推进游标，不因取消丢失数据。缓存仅存当前页面内存，离开后取消请求并释放，不写入明文索引。
+
+搜索输入采用 250 毫秒防抖；页面使用请求序号与取消令牌拒绝旧搜索和旧分页的迟到结果。滚动到已加载末尾附近时增量查询，不重建已有条目；也保留“加载更多”。刷新、删除/清空及进行中的生成任务结束后新建查询会话，保持当前关键词。删除与清空仍需确认，确认返回时再次检查任务空闲和页面有效；页面级错误本地显示，不替换用户当前页面。`SelectNavigation` 和窗口关闭负责取消历史页，历史列表不创建空闲轮询、模型请求或微信操作。
+
 ### 7.1 按备注查找与复用
 
 `LocalRepository.FindContactByName` 解密当前 scope 内的档案后查找。匹配规则为：

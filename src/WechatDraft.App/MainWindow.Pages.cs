@@ -12,51 +12,10 @@ public sealed partial class MainWindow
     {
         SelectNavigation(nameof(ShowHistory));
         _homeVisible = false;
-        var content = Ui.Stack(20, Ui.Text("历史记录", 28, bold: true), Ui.Text("保留每次生成的正文和当时的联系人信息。预填状态不代表已发送。", 13, "7C8B81"));
-        var search = Ui.Input("搜索", "", "联系人、场景、正文或状态");
-        var list = Ui.Stack(12); var count = Ui.Text("", 12, "859189"); int loaded = 100;
-        void Render()
-        {
-            list.Children.Clear(); var keyword = search.Text.Trim();
-            var records = _repository.History(_settings.AccountScope, loaded).Where(x => keyword.Length == 0 ||
-                (x.DisplayName + x.Scene + x.Greeting + x.FillStatus).Contains(keyword, StringComparison.OrdinalIgnoreCase)).ToList();
-            count.Text = $"当前显示 {records.Count} 条 · 历史保留 {(_settings.RetentionDays == 0 ? "至手动清理" : _settings.RetentionDays + " 天")}";
-            if (records.Count == 0) { list.Children.Add(Ui.Card(Ui.Stack(12, Ui.Text("还没有记录", 19, bold: true), Ui.Text("生成的每一句祝福，都会出现在这里。", 13, "8A978E")))); return; }
-            foreach (var record in records)
-            {
-                var text = Ui.Text(record.Greeting.Length > 0 ? record.Greeting : record.Error, 15); text.IsTextSelectionEnabled = true;
-                var metadata = $"{record.StartedAt.ToLocalTime():MM月dd日 HH:mm} · {record.Model} · 生成请求 {record.ApiCallCount} 次 · 布局请求 {record.LayoutApiCallCount} 次 · 上滚 {record.ScrollCount} 次";
-                var header = Ui.Row(10, Ui.Text(record.DisplayName.Length > 0 ? record.DisplayName : "未识别联系人", 17, bold: true), Ui.Badge(record.Scene), Ui.Badge(record.FillStatus, "778278", "F0F3F0"));
-                var actions = Ui.Row(8, Ui.Button("复制正文", () => CopyText(record.Greeting)), IdleAction("删除", async () =>
-                { if (await ConfirmAsync("删除这条历史？", "删除后无法在本应用中恢复。") && !IsTaskBusy) { _repository.DeleteTask(record.Id); Render(); } }));
-                if (record.DebugDirectory is { } debugPath)
-                    actions.Children.Add(Ui.Button("查看调试记录", () =>
-                    {
-                        var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "debug")) + Path.DirectorySeparatorChar;
-                        var folder = Path.GetFullPath(debugPath);
-                        if (folder.StartsWith(root, StringComparison.OrdinalIgnoreCase) && Directory.Exists(folder))
-                            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(folder) { UseShellExecute = true });
-                        else Notify("这条任务的调试目录不存在或不属于当前客户端。", InfoBarSeverity.Informational);
-                    }));
-                var body = Ui.Stack(12, header, text, Ui.Text(metadata, 11, "8E9991"),
-                    Ui.Text($"关系：{RelationshipLabel(record.Relationship)}  ·  称呼：{record.AddressTerm ?? "未知"}  ·  身份：{record.IdentityLabel ?? "未知"}", 12, "7C8C81"));
-                if (record.AddressTerm is not null) body.Children.Add(Ui.Text("称呼来源：" + AddressSourceLabel(record.AddressTermSource), 11, "7C8C81"));
-                if (record.AddressEvidence is { } historyEvidence) body.Children.Add(Ui.Text("聊天依据（你发出的消息）：" + historyEvidence.Quote, 12, "7C8C81"));
-                if (record.IsDemo) body.Children.Add(Ui.Badge("演示记录 · 虚构联系人", "847446", "F6F1E3"));
-                if (record.ContactReused) body.Children.Add(Ui.Badge("已按备注复用联系人档案"));
-                if (record.AutomationMethod is "uia" or "vision") body.Children.Add(Ui.Badge(record.AutomationMethod == "vision" ? "纯视觉" : "UIA"));
-                if (record.FallbackReason.Length > 0) body.Children.Add(Ui.Text("视觉兜底原因：" + record.FallbackReason, 11, "8D7954"));
-                if (record.OriginalTextRead == false) body.Children.Add(Ui.Badge("只采集截图 · 未读取草稿"));
-                if (record.OriginalPreserved == true) body.Children.Add(Ui.Badge($"已核对原文保留 · {record.OriginalCharacters} 个字符"));
-                if (record.Error.Length > 0) body.Children.Add(Ui.Text(record.Error, 12, "9D8050"));
-                body.Children.Add(actions); list.Children.Add(Ui.Card(body));
-            }
-        }
-        search.TextChanged += (_, _) => Render();
-        content.Children.Add(search); content.Children.Add(count); content.Children.Add(list);
-        content.Children.Add(Ui.Row(10, Ui.Button("加载更多", () => { loaded += 100; Render(); }), IdleAction("清空历史", async () =>
-        { if (await ConfirmAsync("清空所有历史？", "这会删除演示和真实任务的全部历史，联系人档案仍可保留。") && !IsTaskBusy) { _repository.ClearHistory(); Render(); } })));
-        Render(); Present(content);
+        _historyView = new HistoryPageView(_repository, _settings.AccountScope, _settings.RetentionDays,
+            () => !IsTaskBusy, ConfirmAsync, CopyText);
+        _historyView.SetTaskBusy(IsTaskBusy);
+        _page.Content = _historyView;
     }
 
     private void ShowContacts()
@@ -118,7 +77,7 @@ public sealed partial class MainWindow
         _repository.SaveContact(contact); SeedDemoContacts(); ShowContacts();
     }
 
-    private static string AddressSourceLabel(string source) => source switch
+    internal static string AddressSourceLabel(string source) => source switch
     {
         "chat_message" => "聊天中你对对方的称呼（模型候选）",
         "user" => "你填写或确认",
@@ -193,6 +152,6 @@ public sealed partial class MainWindow
             options));
     }
     private static string? NullIfEmpty(string value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
-    private static string RelationshipLabel(string relationship) => relationship switch
+    internal static string RelationshipLabel(string relationship) => relationship switch
     { "family" => "家人", "friend" => "朋友", "colleague" => "同事", "manager" => "领导", "teacher" => "老师", "customer" => "客户", "other" => "其他", _ => "未知" };
 }

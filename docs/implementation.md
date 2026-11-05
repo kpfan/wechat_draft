@@ -22,6 +22,7 @@
 | `src/WechatDraft.Core/Models.cs` | 配置、联系人、历史和模型响应；定义 `IConversationAdapter`、`IGreetingModel`、`ISecretProtector` |
 | `src/WechatDraft.Core/VisionLayout.cs` | 布局协议与校验、受限 UIA 兜底路由、完整原文比对及单次后缀追加流程 |
 | `src/WechatDraft.Core/CompatibleModelClient.cs` | 多模态 Chat Completions 协议、厂商参数、响应解析与限流处理 |
+| `src/WechatDraft.Core/GreetingPrompts.cs` | 集中维护称呼识别、节日祝福写作与原有输出协议的系统提示 |
 | `src/WechatDraft.Core/DraftRules.cs` | 地址、正文、场景、字数和换行追加规则 |
 | `src/WechatDraft.Core/ExampleService.cs` | 范例文件校验、增改删、原子保存、选择、有效路径、版本标识与重载回退 |
 | `src/WechatDraft.Core/LocalRepository.cs` | SQLite 设置、联系人、历史、清理和中断恢复 |
@@ -170,6 +171,8 @@ v0 的全局截图调试文件及固定输入偏移不接入；本项目只在�
 “检查视觉定位”只识别布局并显示本地预览：黄色框是可靠匹配的本地工具栏，蓝/绿框分别为聊天和消息，紫框是完整输入面板监测范围，橙色小框及十字表示点击候选和固定点，红框为发送禁区。不复制、不填写、不创建生成历史。每任务最多六次布局请求，初始定位仅允许一次网络或 JSON 错误重试；与最多五次生成请求串行共享总预算。历史新增 `LayoutApiCallCount`、`AutomationMethod`、`FallbackReason`，与原 `ApiCallCount` 分开统计，沿用加密 JSON 存储，无破坏性迁移。`layout-synthetic` 诊断仅上传生成的虚构窗口图，在内存中配置该图的上传范围，不保存或扩大真实窗口授权。
 
 ## 5. 模型协议与内容规则
+
+生成系统提示集中在 `GreetingPrompts.SystemPrompt`，由现有 `CompatibleModelClient.GenerateAsync` 引用。称呼识别和祝福写作在同一次请求内完成，保留原有 `ModelResponse`、称呼证据、请求预算、字数与表情规则；不引入 Agent 框架或新的调用阶段。提示词补充消息方向与身份纠正、节日意象、敬语和事实边界，具体迁入范围与负责文件见[提示词接入说明](prompt-integration.md)。这些语义规则由模型执行，本地校验范围不扩大。
 
 真实生成请求携带场景、补充要求、按备注匹配的档案、至多三条范例及 PNG data URL，不再发送固定的 `tone`。系统提示要求结合当前聊天、已确认关系和补充要求自然选择措辞，缺少依据时保持自然温和。首页移除语气下拉框，场景独占一行。`AppSettings` 不再包含 `Tone`，旧配置中的字段按未知字段忽略，后续保存不再带回；`TaskRecord.Tone` 仅兼容历史，新记录为 `auto`，既有历史值不改写。既有草稿不作为生成提示词；视觉布局和选区复核的整窗图像可能包含草稿，受独立授权控制。范例按启用状态和场景筛选，再按关系排序；JSON 范例 schema、语气标签与唯一 ID 保留，语气标签只用于库校验和阅读，不参与偏好加权。版本由文件版本与内容哈希组合标记。
 

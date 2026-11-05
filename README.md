@@ -128,6 +128,8 @@ git push origin main
 
 ## 项目结构
 
+提示词集中维护在 `src/WechatDraft.Core/GreetingPrompts.cs`。本次提示词贡献的负责文件、原型适配取舍和验证方式见[提示词接入说明](docs/prompt-integration.md)。
+
 | 路径 | 内容 |
 | --- | --- |
 | `src/WechatDraft.App` | WinUI 3 界面及演示适配器 |

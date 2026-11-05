@@ -1,0 +1,12 @@
+<Project>
+  <PropertyGroup>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <NuGetAudit>true</NuGetAudit>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(ProductionMode)' == 'true'">
+    <DefineConstants>$(DefineConstants);WECHAT_DRAFT_PRODUCTION</DefineConstants>
+  </PropertyGroup>
+</Project>

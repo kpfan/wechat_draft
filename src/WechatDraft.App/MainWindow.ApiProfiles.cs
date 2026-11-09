@@ -109,15 +109,14 @@ public sealed partial class MainWindow
             var renderedOrigin = "";
             try { renderedOrigin = DraftRules.Origin(formSettings); } catch (InvalidDataException) { }
             var consent = new CheckBox { Content = "同意把必要聊天截图上传至上方服务地址", IsChecked = renderedOrigin.Length > 0 && formSettings.AuthorizedOrigin == renderedOrigin };
-            var visionConsent = new CheckBox { Content = "允许视觉定位上传完整微信窗口（含联系人列表及已有草稿）", IsChecked = renderedOrigin.Length > 0 && formSettings.VisionAuthorizedOrigin == renderedOrigin };
             void EndpointChanged()
             {
                 try
                 {
                     var candidate = formSettings with { BaseUrl = baseUrl.Text, ApiPath = path.Text, AllowLoopbackHttp = local.IsChecked == true };
-                    if (DraftRules.Origin(candidate) != renderedOrigin) { consent.IsChecked = false; visionConsent.IsChecked = false; }
+                    if (DraftRules.Origin(candidate) != renderedOrigin) consent.IsChecked = false;
                 }
-                catch { consent.IsChecked = false; visionConsent.IsChecked = false; }
+                catch { consent.IsChecked = false; }
             }
             baseUrl.TextChanged += (_, _) => EndpointChanged(); path.TextChanged += (_, _) => EndpointChanged();
             local.Click += (_, _) => EndpointChanged();
@@ -126,7 +125,7 @@ public sealed partial class MainWindow
                 var candidate = formSettings with { BaseUrl = baseUrl.Text.Trim().TrimEnd('/'), ApiPath = path.Text.Trim(), Model = model.Text.Trim(), AllowLoopbackHttp = local.IsChecked == true };
                 var origin = DraftRules.Origin(candidate);
                 candidate.AuthorizedOrigin = consent.IsChecked == true ? origin : "";
-                candidate.VisionAuthorizedOrigin = consent.IsChecked == true && visionConsent.IsChecked == true ? origin : "";
+                candidate.VisionAuthorizedOrigin = ""; // Retired whole-window model positioning consent.
                 if (key.Password.Length > 0) candidate.ProtectedApiKey = _protector.Protect(key.Password);
                 return candidate;
             }
@@ -184,12 +183,13 @@ public sealed partial class MainWindow
             editorCard = Ui.Card(Ui.Stack(16,
                 Ui.Text(adding ? "添加新的 API" : "编辑 API · " + editedProfile!.ApiProfileName, 20, bold: true),
                 Ui.Badge("Chat Completions 图像协议"),
-                profileName, baseUrl, path, model, key, local, consent, visionConsent,
+                profileName, baseUrl, path, model, key, local, consent,
+                Ui.Text("UIA 不可用时用本地模板定位，不上传整窗。生成及发送核对仅上传标题和消息裁剪。", 12, "71817B"),
                 Ui.Row(10, save, test, clearKey, cancel), editorStatus,
                 Ui.Text("测试仅上传自动生成的验证码图片，可能产生模型费用。不会上传微信截图。保存不会改变「使用中」的勾选。", 11, "8A978E")));
             foreach (var input in new[] { profileName, baseUrl, path, model }) input.TextChanged += (_, _) => editorDirty = true;
             key.PasswordChanged += (_, _) => editorDirty = true;
-            foreach (var checkbox in new[] { local, consent, visionConsent }) checkbox.Click += (_, _) => editorDirty = true;
+            foreach (var checkbox in new[] { local, consent }) checkbox.Click += (_, _) => editorDirty = true;
         }
         var content = Ui.Stack(20, Ui.Text("API 管理", 28, bold: true),
             Ui.Text("连接多组多模态模型服务。勾选哪一组，生成任务就使用哪一组；已保存的 API 可以随时修改链接和模型。", 13, "7C8B81"),

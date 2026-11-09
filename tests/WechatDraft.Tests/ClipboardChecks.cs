@@ -79,6 +79,15 @@ static class ClipboardChecks
             Require(backend.Disposed && backend.SnapshotDisposed, "failed restore leaked resources");
             using var next = new ClipboardSession(new FakeClipboard());
         });
+        yield return ("An updated but busy clipboard is a read failure rather than an unchanged clipboard", () =>
+        {
+            var backend = new FakeClipboard();
+            using var session = new ClipboardSession(backend);
+            session.PutText("probe"); backend.Copy(7, "原有草稿"); backend.Busy = true;
+            Invalid(() => session.TryReadCopied(7, out _));
+            backend.Busy = false;
+            Require(session.TryReadCopied(7, out var text) && text == "原有草稿", "busy copy data was lost");
+        });
     }
 
     private static Dictionary<uint, byte[]> Clone(Dictionary<uint, byte[]> data) => data.ToDictionary(x => x.Key, x => x.Value.ToArray());

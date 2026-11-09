@@ -4,8 +4,37 @@ using System.Text.RegularExpressions;
 
 namespace WechatDraft.Core;
 
+public sealed class GroupChatDetectedException() : InvalidOperationException("聊天标题末尾的括号人数大于 2，按群聊处理，已停止生成和填写。");
+
 public static partial class DraftRules
 {
+    public static bool LooksLikeGroupTitle(string? title)
+    {
+        if (string.IsNullOrWhiteSpace(title)) return false;
+        var match = GroupMemberSuffix().Match(title);
+        if (!match.Success) return false;
+        // Compare digit strings to avoid overflow even for an abnormally large count.
+        // OCR may split one number into words (112 -> "1 12"). Normalize only
+        // this numeric suffix; retain the original title for conversation matching.
+        var digits = string.Concat(match.Groups["count"].Value.Where(c => !char.IsWhiteSpace(c))
+            .Select(c => c is >= '０' and <= '９' ? (char)('0' + c - '０') : c)).TrimStart('0');
+        return digits.Length > 1 || (digits.Length == 1 && digits[0] > '2');
+    }
+
+    public static void ValidateConversation(ModelResponse response, IReadOnlyList<Capture> captures)
+    {
+        if (!captures.Any(c => c.RequiresConversationCheck)) return;
+        var localTitles = captures.Where(c => c.LocalTitle is not null).Select(c => c.LocalTitle!).Distinct(StringComparer.Ordinal).ToArray();
+        if (localTitles.Length > 1) throw new InvalidDataException("本次截图的本地 OCR 标题不一致。");
+        var title = localTitles.Length == 1 ? localTitles[0] : response.ObservedDisplayName;
+        if (string.IsNullOrWhiteSpace(title) || title.Length > 80 || title.Any(char.IsControl))
+            throw new InvalidDataException("截图中的完整聊天标题未能明确识别，无法检查群聊人数后缀。");
+        var group = LooksLikeGroupTitle(title);
+        DebugSession.Current?.Event("title_conversation_check", new { rule = "trailing-parenthesized-count-greater-than-two",
+            group, modelTypeUsed = false, writeAuthorized = false });
+        if (group) throw new GroupChatDetectedException();
+    }
+
     public static readonly string[] Relationships = ["family", "friend", "colleague", "manager", "teacher", "customer", "other", "unknown"];
 
     public static string AppendSuffix(string existing, string greeting) =>
@@ -78,13 +107,13 @@ public static partial class DraftRules
         evidence.Quote.Contains(address, StringComparison.Ordinal) && evidence.Quote.Trim() != address &&
         (captures is null || captures.Any(capture => capture.Id == evidence.CaptureId));
 
-    public static void ValidateSalutation(ModelResponse response, Contact? contact, IReadOnlyList<Capture> captures)
+    public static void ValidateSalutation(ModelResponse response, Contact? contact, IReadOnlyList<Capture> captures, string? localTitle = null)
     {
         var address = ResolveAddressTerm(contact, response);
         if (address is null)
         {
             // Also reject obvious title-as-vocative output when the model leaves address_term empty.
-            var names = new[] { contact?.DisplayName, contact?.RemarkName, response.ObservedDisplayName };
+            var names = new[] { contact?.DisplayName, contact?.RemarkName, localTitle ?? response.ObservedDisplayName };
             if (names.Where(name => !string.IsNullOrWhiteSpace(name)).Any(name =>
                 new[] { "，", ",", "：", ":", "您好", "你好" }.Any(separator => response.GreetingText.StartsWith(name!.Trim() + separator, StringComparison.Ordinal))))
                 throw new InvalidDataException("正文疑似直接把标题、备注或昵称当作称呼，缺少聊天消息依据。");
@@ -127,4 +156,7 @@ public static partial class DraftRules
 
     [GeneratedRegex(@"\{[^{}]*\}|\[[^\[\]]*(称呼|姓名|场景)[^\[\]]*\]")]
     private static partial Regex Placeholder();
+
+    [GeneratedRegex(@"(?:\(\s*(?<count>[0-9０-９](?:\s*[0-9０-９])*)\s*\)|（\s*(?<count>[0-9０-９](?:\s*[0-9０-９])*)\s*）)\s*\z", RegexOptions.CultureInvariant)]
+    private static partial Regex GroupMemberSuffix();
 }

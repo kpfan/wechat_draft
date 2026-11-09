@@ -1,6 +1,7 @@
 using System;
 using System.Linq;
 using System.Text.RegularExpressions;
+using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
 
@@ -25,7 +26,6 @@ public static class WechatConversationRules
     private const string GroupTitleFeature = "ChatRoom";
     private const string SingleTitleFeature = "ChatSingle";
     private static readonly string[] BrandTitleFeatures = ["ChatBrand", "Official"];
-    private static readonly Regex MemberCountInTitle = new(@"[（(]\d+[）)]", RegexOptions.Compiled);
     public static readonly Regex MemberCountLeaf = new(@"^[（(]\s*(\d+)\s*[)）]$", RegexOptions.Compiled);
     // 功能/系统账号不是“某个人”；精确匹配，避免误伤包含这些词的普通备注。
     private static readonly string[] NonPersonalNames =
@@ -56,7 +56,7 @@ public static class WechatConversationRules
     {
         var name = evidence.ChatName ?? "";
         if (name.Contains("文件传输助手", StringComparison.Ordinal) || name.Contains("公众号", StringComparison.Ordinal) ||
-            NonPersonalNames.Contains(name.Trim()) || MemberCountInTitle.IsMatch(name))
+            NonPersonalNames.Contains(name.Trim()) || DraftRules.LooksLikeGroupTitle(name))
             throw new InvalidOperationException("当前会话不是与某个人的私聊，已停止；未调用模型。");
         if (evidence.HasGroupAffordance)
             throw new InvalidOperationException("检测到群聊信息入口，不能确认当前为私聊，已停止自动处理。");

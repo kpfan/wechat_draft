@@ -7,7 +7,8 @@ namespace WechatDraft.App;
 
 public sealed partial class HistoryPageView : UserControl, IDisposable
 {
-    private const int PageSize = 40;
+    private int _pageSize = 40;
+    private int _pageIndex;
     private readonly LocalRepository _repository;
     private readonly string _scope;
     private readonly string _retention;
@@ -19,7 +20,7 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
     private CancellationTokenSource? _requestCancellation;
     private int _revision;
     private bool _initialized, _disposed, _loading, _taskBusy, _mutationBusy, _hasMore;
-    private string _query = "";
+    private HistoryFilter _filter = new();
     private int? _totalMatches;
 
     public HistoryPageView(LocalRepository repository, string scope, int retentionDays, Func<bool> canModify,
@@ -57,21 +58,60 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
         _ = RefreshAsync(false);
     }
 
-    private async Task RefreshAsync(bool debounce)
+    private void FilterChanged(object sender, SelectionChangedEventArgs args)
+    { if (_initialized && !_disposed) _ = RefreshAsync(false); }
+
+    private void DateFilterChanged(CalendarDatePicker sender, CalendarDatePickerDateChangedEventArgs args)
+    { if (_initialized && !_disposed) _ = RefreshAsync(false); }
+
+    private void PageSizeChanged(object sender, SelectionChangedEventArgs args)
+    {
+        if (!_initialized || _disposed) return;
+        _pageSize = PageSizeBox.SelectedIndex switch { 0 => 20, 2 => 80, _ => 40 };
+        _ = RefreshAsync(false);
+    }
+
+    private void ResetClicked(object sender, RoutedEventArgs args)
+    {
+        _initialized = false;
+        SearchBox.Text = ContactBox.Text = SceneBox.Text = "";
+        StatusBox.SelectedIndex = ModeBox.SelectedIndex = 0;
+        FromPicker.Date = ToPicker.Date = null;
+        _initialized = true;
+        _ = RefreshAsync(false);
+    }
+
+    private HistoryFilter ReadFilter() => new()
+    {
+        Keyword = SearchBox.Text.Trim(), Contact = ContactBox.Text.Trim(), Scene = SceneBox.Text.Trim(),
+        FillStatus = StatusBox.SelectedIndex > 0 ? (string)StatusBox.SelectedItem : "",
+        IsDemo = ModeBox.SelectedIndex switch { 1 => false, 2 => true, _ => null },
+        FromDate = FromPicker.Date is { } from ? DateOnly.FromDateTime(from.DateTime) : null,
+        ToDate = ToPicker.Date is { } to ? DateOnly.FromDateTime(to.DateTime) : null
+    };
+
+    private Task RefreshAsync(bool debounce) => LoadPageAsync(0, ReadFilter(), debounce);
+
+    private async Task LoadPageAsync(int pageIndex, HistoryFilter filter, bool debounce = false)
     {
         if (_disposed || _session is null) return;
         CancelRequest();
         var revision = _revision;
         var cancellation = _requestCancellation = new();
         var session = _session;
-        var query = SearchBox.Text.Trim();
+
         _loading = true; Feedback.IsOpen = false; UpdateControls();
         try
         {
             if (debounce) await Task.Delay(250, cancellation.Token);
-            var result = await session.SearchAsync(query, 0, PageSize, cancellation.Token);
+            var result = await session.SearchAsync(filter, checked(pageIndex * _pageSize), _pageSize, cancellation.Token);
+            if (result.Records.Count == 0 && pageIndex > 0 && result.TotalMatches is { } total)
+            {
+                pageIndex = Math.Max(0, (total - 1) / _pageSize);
+                result = await session.SearchAsync(filter, pageIndex * _pageSize, _pageSize, cancellation.Token);
+            }
             if (_disposed || revision != _revision) return;
-            _query = query; _items.Clear();
+            _filter = filter; _pageIndex = pageIndex; _items.Clear();
             foreach (var record in result.Records) _items.Add(CreateItem(record));
             _hasMore = result.HasMore; _totalMatches = result.TotalMatches;
             if (_items.Count > 0) HistoryList.ScrollIntoView(_items[0]);
@@ -79,7 +119,7 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
         catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
         catch (Exception e)
         {
-            if (!_disposed && revision == _revision) { _hasMore = false; ShowError("历史读取失败：" + e.Message); }
+            if (!_disposed && revision == _revision) { _hasMore = false; _items.Clear(); _pageIndex = 0; _totalMatches = null; ShowError("历史读取失败：" + e.Message); }
         }
         finally
         {
@@ -87,32 +127,14 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
         }
     }
 
-    private void ContainerChanging(ListViewBase sender, ContainerContentChangingEventArgs args)
-    {
-        if (!_disposed && !_loading && !args.InRecycleQueue && args.ItemIndex >= _items.Count - 5 && _hasMore)
-            _ = LoadMoreAsync();
-    }
+    private void FirstClicked(object sender, RoutedEventArgs args)
+    { if (!_loading && _pageIndex > 0) _ = LoadPageAsync(0, _filter); }
 
-    private void MoreClicked(object sender, RoutedEventArgs args) => _ = LoadMoreAsync();
+    private void PreviousClicked(object sender, RoutedEventArgs args)
+    { if (!_loading && _pageIndex > 0) _ = LoadPageAsync(_pageIndex - 1, _filter); }
 
-    private async Task LoadMoreAsync()
-    {
-        if (_disposed || _loading || !_hasMore || _session is null || _requestCancellation is null) return;
-        var revision = _revision; var cancellation = _requestCancellation;
-        _loading = true; UpdateControls();
-        try
-        {
-            var result = await _session.SearchAsync(_query, _items.Count, PageSize, cancellation.Token);
-            if (_disposed || revision != _revision) return;
-            foreach (var record in result.Records) _items.Add(CreateItem(record));
-            _hasMore = result.HasMore; _totalMatches = result.TotalMatches;
-        }
-        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { }
-        catch (Exception e)
-        { if (!_disposed && revision == _revision) { _hasMore = false; ShowError("加载更多失败：" + e.Message); } }
-        finally
-        { if (!_disposed && revision == _revision) { _loading = false; UpdateControls(); } }
-    }
+    private void NextClicked(object sender, RoutedEventArgs args)
+    { if (!_loading && _hasMore) _ = LoadPageAsync(_pageIndex + 1, _filter); }
 
     private HistoryItem CreateItem(TaskRecord record) => new(record, () => _copy(record.Greeting),
         () => _ = DeleteAsync(record), () => OpenDebug(record), () => CanModify);
@@ -126,7 +148,7 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
             _mutationBusy = true; UpdateControls();
             CancelRequest(); _repository.DeleteTask(record.Id);
             _session = new(_repository, _scope);
-            await RefreshAsync(false);
+            await LoadPageAsync(_pageIndex, ReadFilter());
         }
         catch (Exception e) { if (!_disposed) ShowError("删除失败：" + e.Message); }
         finally { _mutationBusy = false; if (!_disposed) UpdateControls(); }
@@ -165,13 +187,14 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
     {
         if (!_initialized || _disposed) return;
         LoadingRing.IsActive = _loading;
-        MoreButton.Visibility = _hasMore ? Visibility.Visible : Visibility.Collapsed;
-        MoreButton.IsEnabled = !_loading;
+        FirstButton.IsEnabled = PreviousButton.IsEnabled = !_loading && _pageIndex > 0;
+        NextButton.IsEnabled = !_loading && _hasMore;
+        PageText.Text = $"第 {_pageIndex + 1} 页" + (_totalMatches is { } count ? $" / {Math.Max(1, (count + _pageSize - 1) / _pageSize)} 页" : "");
         ClearButton.IsEnabled = CanModify;
         foreach (var item in _items) item.RefreshActions();
         CountText.Text = _loading ? "正在读取历史……" :
-            $"已显示 {_items.Count} 条" + (_totalMatches is { } total ? $" / 共 {total} 条" : "") + $" · 历史保留 {_retention}";
-        EmptyState.Text = SearchBox.Text.Trim().Length > 0 ? "未找到匹配记录" : "还没有记录";
+            $"本页 {_items.Count} 条" + (_totalMatches is { } total ? $" / 共 {total} 条" : "") + $" · 历史保留 {_retention}";
+        EmptyState.Text = ReadFilter() != new HistoryFilter() ? "未找到匹配记录" : "还没有记录";
         EmptyState.Visibility = !_loading && _items.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
     }
 

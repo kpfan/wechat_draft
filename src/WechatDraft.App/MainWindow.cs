@@ -215,7 +215,7 @@ public sealed partial class MainWindow : Window
                 Ui.Row(12, Ui.Text("视觉定位预览", 17, bold: true), Ui.Button("收起预览", () =>
                 { if (_visionPreviewCard is not null) _visionPreviewCard.Visibility = Visibility.Collapsed; })),
                 _visionPreview,
-                Ui.Text("黄框：本地图标；蓝框：聊天；绿框：消息；紫框：输入面板；橙框与十字：定位点；红框：禁止点击。", 12, "71817B")));
+                Ui.Text("黄框：本地图标；蓝框：聊天与标题；绿框：消息；紫框：输入面板；橙框：编辑区估算；红框：发送区域估算。仅预览，不点击或填写。", 12, "71817B")));
             _visionPreviewCard.Visibility = Visibility.Collapsed;
             body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, resultCard, BuildSentRecordingControls());
         }
@@ -331,14 +331,14 @@ public sealed partial class MainWindow : Window
 
     private IConversationAdapter CreateConversationAdapter(nint target, AppSettings settings)
     {
-        if (settings.AutomationMode == "vision") return CreateVisionAdapter(target, settings);
+        if (settings.AutomationMode == "vision") return CreateVisionAdapter(target, settings.EnableLiveAppend);
         var uia = new WechatAdapter(target, settings.EnableLiveAppend, WinRT.Interop.WindowNative.GetWindowHandle(this),
             progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent)));
-        return settings.AutomationMode == "uia" ? uia : new FallbackConversationAdapter(uia, () => CreateVisionAdapter(target, settings));
+        return settings.AutomationMode == "uia" ? uia : new FallbackConversationAdapter(uia, () => CreateVisionAdapter(target, settings.EnableLiveAppend));
     }
-    private WechatVisionAdapter CreateVisionAdapter(nint target, AppSettings settings) => new(target,
-        WinRT.Interop.WindowNative.GetWindowHandle(this), false, settings, _client, _protector,
-        progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent)));
+    private WechatVisionAdapter CreateVisionAdapter(nint target, bool enableAppend = false) => new(target,
+        progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent)), enableAppend,
+        clipboardOwner: WinRT.Interop.WindowNative.GetWindowHandle(this), companion: WinRT.Interop.WindowNative.GetWindowHandle(this));
 
     private async Task CheckVisionAsync()
     {
@@ -349,7 +349,7 @@ public sealed partial class MainWindow : Window
         _runCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(_settings.TaskTimeoutSeconds, 10, 180)));
         SetBusy(true);
         using var debug = DebugSession.Begin(_settings.DebugMode, Path.Combine(AppContext.BaseDirectory, "debug"), "layout-check");
-        using var adapter = CreateVisionAdapter(window.Handle, _settings with { });
+        using var adapter = CreateVisionAdapter(window.Handle);
         try
         {
             if (_visionPreviewCard is not null) _visionPreviewCard.Visibility = Visibility.Collapsed;
@@ -364,7 +364,7 @@ public sealed partial class MainWindow : Window
                 _visionPreview.Source = bitmap; _visionPreview.Visibility = Visibility.Visible;
                 if (_visionPreviewCard is not null) _visionPreviewCard.Visibility = Visibility.Visible;
             }
-            var detail = $"识别到单聊“{layout.Title}”，布局请求 {adapter.LayoutApiCallCount} 次。未复制草稿、未填写。";
+            var detail = "本地双锚点及区域分界定位完成，模型定位请求 0 次。区域为几何估算，尚未确认聊天身份或类型；未读取草稿、未填写。";
             ShowProgress("视觉定位通过", detail, 100); Notify(detail, InfoBarSeverity.Success);
         }
         catch (OperationCanceledException) { ShowProgress("已取消或超时", "视觉检查已结束，未填写。", 100); }

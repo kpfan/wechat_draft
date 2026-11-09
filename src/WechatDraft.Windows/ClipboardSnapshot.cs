@@ -80,7 +80,7 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
     private static ClipboardEntry Read(uint format, long remaining)
     {
         var handle = Native.GetClipboardData(format);
-        if (handle == 0) throw new InvalidOperationException("剪贴板有尚未提供的数据，未修改原内容。");
+        if (handle == 0 && format != 2) throw new InvalidOperationException("剪贴板有尚未提供的数据，未修改原内容。");
         var kind = format switch { 2 or 0x82 => ClipboardStorage.Bitmap, 9 => ClipboardStorage.Palette,
             14 or 0x8e => ClipboardStorage.EnhancedMetafile, 3 or 0x83 => ClipboardStorage.MetafilePicture, _ => ClipboardStorage.Global };
         long size; byte[]? bytes = null; nint copy = 0; var picture = default(Native.MetafilePicture);
@@ -88,7 +88,17 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
         {
             case ClipboardStorage.Bitmap:
                 if (Native.GetBitmapObject(handle, Marshal.SizeOf<Native.BitmapObject>(), out var bitmap) == 0 || bitmap.Width <= 0 || bitmap.Height == 0)
-                    throw new InvalidOperationException("无法读取剪贴板图片尺寸。");
+                {
+                    if (format != 2) throw new InvalidOperationException("无法读取剪贴板图片尺寸。");
+                    var dibFormat = Native.IsClipboardFormatAvailable(8) ? 8u : Native.IsClipboardFormatAvailable(17) ? 17u : 0;
+                    if (dibFormat == 0) throw new InvalidOperationException("无法读取剪贴板图片尺寸，且没有独立图片数据可备份。");
+                    using var dib = Read(dibFormat, remaining);
+                    var prepared = ClipboardDibBitmap.Prepare(dib.Bytes!);
+                    try { size = prepared.PixelBytes; CheckSize(size, remaining); copy = ClipboardDibBitmap.Create(prepared.Bmp); }
+                    finally { Array.Clear(prepared.Bmp); }
+                    WechatDraft.Core.DebugSession.Current?.Event("clipboard_bitmap_rebuilt", new { fromFormat = dibFormat, bytes = size });
+                    break;
+                }
                 size = checked(Math.Abs((long)bitmap.Height) * Math.Abs((long)bitmap.WidthBytes));
                 CheckSize(size, remaining);
                 copy = Native.CopyImage(handle, 0, 0, 0, 0x2000);
@@ -278,6 +288,26 @@ internal sealed class NativeClipboardBackend : IClipboardBackend
     {
         if (!Native.IsClipboardFormatAvailable(13) || new uint[] { 2, 8, 15, 17 }.Any(Native.IsClipboardFormatAvailable))
             throw new InvalidOperationException("草稿不是可完整读取的普通文本，已停止操作。");
+        foreach (var name in new[] { "PNG", "JFIF", "FileContents", "FileGroupDescriptorW" })
+            if (Native.IsClipboardFormatAvailable(Native.RegisterClipboardFormat(name)))
+                throw new InvalidOperationException("草稿包含图片或附件，未继续填写。");
+        foreach (var name in new[] { "HTML Format", "Rich Text Format" })
+        {
+            var format = Native.RegisterClipboardFormat(name);
+            if (!Native.IsClipboardFormatAvailable(format)) continue;
+            var data = Native.GetClipboardData(format); var size = Native.GlobalSize(data);
+            if (data == 0 || size > 1024 * 1024) throw new InvalidOperationException("草稿附加格式无法核对，未继续填写。");
+            var memory = Native.GlobalLock(data);
+            if (memory == 0) throw new InvalidOperationException("无法核对草稿附加格式。");
+            var bytes = new byte[(int)size];
+            try
+            {
+                Marshal.Copy(memory, bytes, 0, bytes.Length);
+                if (ContainsEmbeddedObject(Encoding.ASCII.GetString(bytes), name == "Rich Text Format"))
+                    throw new InvalidOperationException("草稿包含图片或嵌入对象，未继续填写。");
+            }
+            finally { Array.Clear(bytes); Native.GlobalUnlock(data); }
+        }
         var handle = Native.GetClipboardData(13); var length = Native.GlobalSize(handle);
         if (handle == 0 || length < 2 || length > 131074 || length % 2 != 0) throw new InvalidOperationException("草稿文本无法完整读取或过大。");
         var pointer = Native.GlobalLock(handle);
@@ -285,11 +315,14 @@ internal sealed class NativeClipboardBackend : IClipboardBackend
         try
         {
             var text = Marshal.PtrToStringUni(pointer, (int)length / 2)!.TrimEnd('\0');
-            if (text.Contains('\0')) throw new InvalidOperationException("草稿文本含不支持的对象。");
+            if (text.Contains('\0') || text.Contains('\uFFFC')) throw new InvalidOperationException("草稿文本含不支持的对象。");
             return text;
         }
         finally { Native.GlobalUnlock(handle); }
     }
+    internal static bool ContainsEmbeddedObject(string content, bool rtf) => rtf
+        ? new[] { @"\pict", @"\object", @"\objdata" }.Any(token => content.Contains(token, StringComparison.OrdinalIgnoreCase))
+        : new[] { "<img", "<object", "<embed", "<svg", "<video", "<audio" }.Any(token => content.Contains(token, StringComparison.OrdinalIgnoreCase));
     public void Dispose()
     {
         if (!_ownsWindow) return;

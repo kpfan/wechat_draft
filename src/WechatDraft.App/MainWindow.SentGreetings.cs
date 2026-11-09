@@ -27,7 +27,7 @@ public sealed partial class MainWindow
         return Ui.Card(Ui.Stack(12, Ui.Text("发送后自动保存祝福", 18, bold: true),
             Ui.Text("开启后，你在当前微信单聊手动发送的祝福会按实际文字保存，支持自己写和修改后的内容。无需先生成。", 13, "71817B"),
             _sentStatus, Ui.Row(8, _sentStartButton, Ui.Button("停止归档", () => StopSentRecording())),
-            Ui.Text("仅记录开启时的聊天；换聊天或移动窗口后需重新开启。定位会上传整窗，发送核对使用前后两张标题与消息截图，可能产生模型费用。", 12, "8D713D")));
+            Ui.Text("仅记录开启时的聊天；换聊天或移动窗口后需重新开启。定位及标题 OCR 在本地完成；发送核对只上传前后两张标题与消息截图，可能产生模型费用。", 12, "8D713D")));
     }
 
     private void SentStatus(string message)
@@ -54,9 +54,9 @@ public sealed partial class MainWindow
         try
         {
             var origin = DraftRules.Origin(configuration);
-            if (configuration.AuthorizedOrigin != origin || configuration.VisionAuthorizedOrigin != origin)
-                throw new InvalidDataException("请先在设置中授权聊天截图和整窗视觉定位，再开启归档。");
-            _sentMonitor = await WechatSentGreetingMonitor.StartAsync(window.Handle, configuration, _client, _protector, _runCancellation.Token);
+            if (configuration.AuthorizedOrigin != origin)
+                throw new InvalidDataException("请先在设置中授权必要聊天截图，再开启归档。");
+            _sentMonitor = await WechatSentGreetingMonitor.StartAsync(window.Handle, _runCancellation.Token);
             _sentSession = CancellationTokenSource.CreateLinkedTokenSource(_sentShutdown.Token);
             var sessionToken = _sentSession.Token;
             _sentMonitor.Observed += observation =>

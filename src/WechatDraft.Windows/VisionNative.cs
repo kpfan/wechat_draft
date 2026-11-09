@@ -1,5 +1,7 @@
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
+using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
 
@@ -23,7 +25,7 @@ internal static partial class Native
 
     internal static void VisionChord(ushort key)
     {
-        if (key is not (0x41 or 0x43 or 0x23 or 0x56)) throw new InvalidOperationException("不允许的视觉键盘动作。");
+        if (key is not (0x41 or 0x43 or 0x23 or 0x24 or 0x56)) throw new InvalidOperationException("不允许的视觉键盘动作。");
         var keys = new[] { Key(0x11), Key(key), Key(key, true), Key(0x11, true) };
         for (var i = 0; i < keys.Length; i++) keys[i].Data.Keyboard.ExtraInfo = VisionInputTag;
         try { Keys(keys); }
@@ -42,6 +44,18 @@ internal static partial class Native
         Keys(new INPUT { Type = 0, Data = new InputUnion { Mouse = new MouseInput { Flags = 2, ExtraInfo = VisionInputTag } } },
              new INPUT { Type = 0, Data = new InputUnion { Mouse = new MouseInput { Flags = 4, ExtraInfo = VisionInputTag } } });
     }
+    internal static void VisionCopyAndCollapse()
+    {
+        // One input batch keeps copy/end adjacent and never includes Enter.
+        var keys = new[] { Key(0x11), Key(0x43), Key(0x43, true), Key(0x23), Key(0x23, true), Key(0x11, true) };
+        foreach (ref var input in keys.AsSpan()) input.Data.Keyboard.ExtraInfo = VisionInputTag;
+        try { Keys(keys); }
+        finally
+        {
+            var release = Key(0x11, true); release.Data.Keyboard.ExtraInfo = VisionInputTag;
+            SendInput(1, new[] { release }, Marshal.SizeOf<INPUT>());
+        }
+    }
     internal static void VisionWheel(int delta) => Keys(new INPUT
     { Type = 0, Data = new InputUnion { Mouse = new MouseInput { Flags = 0x800, MouseData = unchecked((uint)delta), ExtraInfo = VisionInputTag } } });
 }
@@ -58,6 +72,9 @@ internal sealed class VisionInputMonitor : IDisposable
     public string Description => _state.Description;
     public bool WheelObserved => _state.WheelObserved;
     public int ActivityVersion => _state.ActivityVersion;
+    public TimeSpan QuietFor => _state.QuietFor;
+    public string? LastActivity => _state.LastActivity;
+    public string LastActivityDescription => _state.LastActivityDescription;
 
     public VisionInputMonitor(nint target, bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true, nint companion = 0)
     {
@@ -74,13 +91,27 @@ internal sealed class VisionInputMonitor : IDisposable
                 _state.Mouse((uint)message, Marshal.PtrToStructure<Native.MouseHookData>(data).Extra == Native.VisionInputTag);
             return Native.CallNextHookEx(0, code, message, data);
         };
-        _foreground = (_, _, hwnd, _, _, _, _) => _state.Foreground(hwnd, Native.GetForegroundWindow(), target, companion);
+        var debug = DebugSession.Current;
+        _foreground = (_, _, hwnd, _, _, _, _) =>
+        {
+            var actual = Native.GetForegroundWindow(); var changed = _state.Changed;
+            _state.Foreground(hwnd, actual, target, companion);
+            if (!changed && _state.Changed && _state.Reason == "foreground-change" && debug is { Enabled: true })
+                debug.Event("visual-foreground-change", new { reported = DescribeWindow(hwnd), actual = DescribeWindow(actual),
+                    target = target.ToInt64(), companion = companion.ToInt64() });
+        };
         var module = Native.GetModuleHandle(null);
         _keyboardHook = Native.SetWindowsHookEx(13, _keyboard, module, 0);
         _mouseHook = Native.SetWindowsHookEx(14, _mouse, module, 0);
         _foregroundHook = Native.SetWinEventHook(3, 3, 0, _foreground, 0, 0, 0);
         if (_keyboardHook == 0 || _mouseHook == 0 || _foregroundHook == 0)
         { Dispose(); throw new InvalidOperationException("无法监测用户操作，已停止预填。"); }
+    }
+    private static object DescribeWindow(nint hwnd)
+    {
+        Native.GetWindowThreadProcessId(hwnd, out var pid); var name = "";
+        try { using var process = Process.GetProcessById((int)pid); name = process.ProcessName; } catch { }
+        return new { handle = hwnd.ToInt64(), processId = pid, processName = name, owner = Native.GetAncestor(hwnd, 3).ToInt64() };
     }
     public void Dispose()
     {

@@ -4,6 +4,7 @@ using System.Threading;
 namespace WechatDraft.Windows;
 
 internal interface IClipboardWrite : IDisposable { void Commit(); }
+internal sealed class ClipboardBusyException(string message) : InvalidOperationException(message);
 internal interface IClipboardSnapshot : IDisposable { IClipboardWrite PrepareRestore(); }
 internal interface IClipboardBackend : IDisposable
 {
@@ -65,7 +66,8 @@ internal sealed class ClipboardSession : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         text = null;
-        if (_backend.Sequence == _sequence || !_backend.Open()) return false;
+        if (_backend.Sequence == _sequence) return false;
+        if (!_backend.Open()) throw new ClipboardBusyException("剪贴板已更新但正被占用，未取得微信原文。");
         try
         {
             if (_backend.Sequence == _sequence) return false;

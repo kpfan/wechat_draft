@@ -21,7 +21,7 @@ internal static class WechatTemplateLocator
     private sealed record GrayImage(int Width, int Height, byte[] Pixels);
     private sealed record Peak(int X, int Y, double Score);
     private sealed record Match(Rectangle Bounds, double Score);
-    private sealed record Sample(int X, int Y, double Centered);
+    private readonly record struct Sample(int Offset, double Centered);
     private sealed record TemplateSamples(int Width, int Height, Sample[] Samples, double Energy);
 
     internal static VisionAnchorHints? Locate(Bitmap screenshot, uint dpi, CancellationToken ct)
@@ -117,35 +117,37 @@ internal static class WechatTemplateLocator
         return new(width, height, pixels);
     }
 
-    private static TemplateSamples Samples(GrayImage image, int limit)
+    private static TemplateSamples Samples(GrayImage image, int limit, int frameWidth)
     {
         var step = Math.Max(1, (int)Math.Ceiling(Math.Sqrt(image.Width * image.Height / (double)limit)));
         var raw = new List<(int X, int Y, double Value)>();
         for (var y = 0; y < image.Height; y += step)
             for (var x = 0; x < image.Width; x += step) raw.Add((x, y, image.Pixels[y * image.Width + x]));
         var mean = raw.Average(sample => sample.Value);
-        var samples = raw.Select(sample => new Sample(sample.X, sample.Y, sample.Value - mean)).ToArray();
+        var samples = raw.Select(sample => new Sample(sample.Y * frameWidth + sample.X, sample.Value - mean)).ToArray();
         return new(image.Width, image.Height, samples, samples.Sum(sample => sample.Centered * sample.Centered));
     }
 
     private static double Score(GrayImage frame, TemplateSamples template, int x, int y)
     {
         if (template.Energy < template.Samples.Length * 4) return -1;
-        double sum = 0, squares = 0, product = 0;
+        var origin = y * frame.Width + x;
+        int sum = 0, squares = 0;
+        double product = 0;
         foreach (var sample in template.Samples)
         {
-            var value = frame.Pixels[(y + sample.Y) * frame.Width + x + sample.X];
+            var value = frame.Pixels[origin + sample.Offset];
             sum += value; squares += value * value; product += value * sample.Centered;
         }
-        var energy = squares - sum * sum / template.Samples.Length;
+        var energy = squares - (double)sum * sum / template.Samples.Length;
         return energy < template.Samples.Length * 4 ? -1 : Math.Clamp(product / Math.Sqrt(energy * template.Energy), -1, 1);
     }
 
     private static Match? Find(GrayImage frame, GrayImage coarseFrame, GrayImage template, Rectangle roi, SearchBudget budget)
     {
         var coarseTemplate = Half(template, budget);
-        var coarseSamples = Samples(coarseTemplate, 128);
-        var samples = Samples(template, 640);
+        var coarseSamples = Samples(coarseTemplate, 128, coarseFrame.Width);
+        var samples = Samples(template, 640, frame.Width);
         var peaks = new List<Peak>();
         var minX = (roi.Left + 1) / 2; var minY = (roi.Top + 1) / 2;
         var maxX = Math.Min(coarseFrame.Width - coarseTemplate.Width, (roi.Right - template.Width) / 2);

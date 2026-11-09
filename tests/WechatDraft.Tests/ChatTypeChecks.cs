@@ -71,10 +71,12 @@ internal static class ChatTypeChecks
             var message = Reject(Private() with { HasSingleChatAffordance = false });
             True(message.Contains("聊天信息"), "missing affordance must be explained");
         });
-        yield return ("UIA numeric-looking chat names stay conservative while member counts use separate leaf text", () =>
+        yield return ("UIA title suffix uses counts above two while independent member-count controls stay authoritative", () =>
         {
-            // 名称本身叫“(1)”时按旧规则保守拒绝；成员数证据来自排除名称控件后的独立叶文本。
-            True(Reject(Private("(1)")).Length > 0, "ambiguous numeric title must stop");
+            WechatConversationRules.RequirePrivateChat(Private("(1)"));
+            WechatConversationRules.RequirePrivateChat(Private("联系人(2)"));
+            WechatConversationRules.RequirePrivateChat(Private("联系人(35)-备注"));
+            True(Reject(Private("联系人（3）")).Length > 0, "group-count suffix must stop");
             Equal(WechatConversationKind.Group, RejectKind(Private("(1)") with { MemberCount = 1 }));
             // 群成员数解析只接受完整括号数字叶文本。
             True(WechatConversationRules.MemberCountLeaf.IsMatch("（35）"));

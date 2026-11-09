@@ -6,6 +6,30 @@ internal static class VisionInteractionChecks
 {
     public static IEnumerable<(string Name, Action Run)> Cases()
     {
+        yield return ("Only external input resets the measured quiet interval", () =>
+        {
+            var time = new InputClock();
+            var state = new VisionInteractionState(false, false, false, time);
+            time.Advance(200);
+            state.Keyboard(true); state.Mouse(0x201, true); state.Mouse(0x200, false); state.Mouse(0x202, false);
+            Equal(TimeSpan.FromMilliseconds(200), state.QuietFor);
+            state.Keyboard(false); Equal(TimeSpan.Zero, state.QuietFor);
+            time.Advance(120); Equal(TimeSpan.FromMilliseconds(120), state.QuietFor);
+            state.Mouse(0x201, false); Equal(TimeSpan.Zero, state.QuietFor);
+            time.Advance(120); state.Mouse(0x20A, false); Equal(TimeSpan.Zero, state.QuietFor);
+            time.Advance(120); state.Mouse(0x20E, false); Equal(TimeSpan.Zero, state.QuietFor);
+            time.Advance(120); state.Foreground(2, 1, 1); Equal(TimeSpan.FromMilliseconds(120), state.QuietFor);
+            state.Foreground(1, 1, 1); Equal(TimeSpan.Zero, state.QuietFor);
+        });
+        yield return ("Input diagnostics distinguish click, wheel and keyboard while ignoring program input and mouse movement", () =>
+        {
+            var state = new VisionInteractionState(false, false, false);
+            state.Mouse(0x201, false); Equal("mouse-click", state.LastActivity);
+            state.Mouse(0x20A, false); Equal("mouse-wheel", state.LastActivity);
+            state.Keyboard(false); Equal("keyboard-input", state.LastActivity); Equal(3, state.ActivityVersion);
+            state.Mouse(0x201, true); state.Mouse(0x200, false); state.Keyboard(true);
+            Equal("keyboard-input", state.LastActivity); Equal(3, state.ActivityVersion); Equal(false, state.Changed);
+        });
         yield return ("Mouse movement, releases and tagged program input never interrupt vision", () =>
         {
             var state = new VisionInteractionState();
@@ -124,6 +148,14 @@ internal static class VisionInteractionChecks
                 for (var x = 0; x < result.Width; x++)
                     if (result.GetPixel(x, y).ToArgb() == Color.Red.ToArgb()) throw new Exception("Draft panel entered greeting context.");
         });
+    }
+
+    private sealed class InputClock : TimeProvider
+    {
+        private long _timestamp;
+        public override long TimestampFrequency => 1000;
+        public override long GetTimestamp() => _timestamp;
+        public void Advance(int milliseconds) => _timestamp += milliseconds;
     }
 
     private static void Equal<T>(T expected, T actual)

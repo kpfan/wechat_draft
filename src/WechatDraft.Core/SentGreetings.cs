@@ -25,6 +25,7 @@ public sealed record SentGreetingRecord
 
 public sealed record SentGreetingResponse
 {
+    [JsonPropertyName("conversation_type")] public string ConversationType { get; init; } = "unknown";
     [JsonRequired, JsonPropertyName("schema_version")] public string SchemaVersion { get; init; } = "";
     [JsonRequired, JsonPropertyName("before_title")] public string BeforeTitle { get; init; } = "";
     [JsonRequired, JsonPropertyName("after_title")] public string AfterTitle { get; init; } = "";
@@ -81,6 +82,9 @@ public sealed class SentGreetingArchiver(LocalRepository repository, ISecretProt
                 ct.ThrowIfCancellationRequested();
                 record.ApiCallCount = 1;
                 var answer = await model.ReadSentGreetingAsync(settings, protector.Unprotect(settings.ProtectedApiKey), observation, ct);
+                if ((observation.Before.RequiresConversationCheck || observation.After.RequiresConversationCheck) &&
+                    answer.ConversationType != "single")
+                    throw new InvalidDataException("截图未能确认是无遮挡的普通单聊，未自动归档正文。");
                 if (answer.SchemaVersion != "1.0" || answer.BeforeTitle.Trim() != observation.DisplayName.Trim() ||
                     answer.AfterTitle.Trim() != observation.DisplayName.Trim())
                     throw new InvalidDataException("发送前后聊天标题不一致，未自动归档正文。");

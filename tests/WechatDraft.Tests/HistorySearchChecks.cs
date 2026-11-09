@@ -57,7 +57,7 @@ internal static class HistorySearchChecks
             True(ids.SequenceEqual(Enumerable.Range(0, 19).Reverse().Select(x => x.ToString("D3"))), "unstable equal-time order");
             return Task.CompletedTask;
         });
-        yield return ("History loading more appends the next matching page without duplicates", async () =>
+        yield return ("History sequential matching pages contain no duplicates", async () =>
         {
             var (repository, _) = Create(); Seed(repository, 91);
             var session = new HistorySearchSession(repository, "default"); var ids = new List<string>();
@@ -68,6 +68,55 @@ internal static class HistorySearchChecks
                 ids.AddRange(page.Records.Select(x => x.Id)); more = page.HasMore;
             }
             Equal(91, ids.Count); Equal(91, ids.Distinct().Count());
+        });
+        yield return ("History filters combine fields and include both local date boundaries", async () =>
+        {
+            var (repository, _) = Create();
+            var day = new DateOnly(2026, 10, 12);
+            TaskRecord Record(string id, DateTimeOffset time, string contact = " Alice ", string scene = "生日", string status = "已预填", bool demo = false) => new()
+            {
+                Id = id, StartedAt = time, CompletedAt = time, DisplayName = contact, Scene = scene,
+                FillStatus = status, IsDemo = demo, Greeting = "Special greeting"
+            };
+            var start = new DateTimeOffset(day.ToDateTime(TimeOnly.MinValue), TimeZoneInfo.Local.GetUtcOffset(day.ToDateTime(TimeOnly.MinValue)));
+            repository.SaveTask(Record("start", start));
+            repository.SaveTask(Record("end", start.AddDays(1).AddTicks(-1)));
+            repository.SaveTask(Record("before", start.AddTicks(-1)));
+            repository.SaveTask(Record("after", start.AddDays(1)));
+            repository.SaveTask(Record("contact", start, contact: "Bob"));
+            repository.SaveTask(Record("scene", start, scene: "春节"));
+            repository.SaveTask(Record("status", start, status: "未预填"));
+            repository.SaveTask(Record("demo", start, demo: true));
+            var filter = new HistoryFilter { Keyword = " SPECIAL ", Contact = "alice", Scene = "生日", FillStatus = "已预填", FromDate = day, ToDate = day, IsDemo = false };
+            var session = new HistorySearchSession(repository, "default");
+            var result = await session.SearchAsync(filter, 0, 40);
+            Equal(2, result.Records.Count); Equal(2, result.TotalMatches);
+            True(result.Records.Select(x => x.Id).Order().SequenceEqual(new[] { "end", "start" }), "date or combined field filters leaked records");
+            Equal(1, (await session.SearchAsync(filter with { IsDemo = true }, 0, 40)).Records.Count);
+            Equal(0, (await session.SearchAsync(filter with { Keyword = "absent" }, 0, 40)).Records.Count);
+            try
+            {
+                await session.SearchAsync(filter with { FromDate = day.AddDays(1) }, 0, 40);
+                throw new Exception("reversed dates accepted");
+            }
+            catch (ArgumentException) { }
+        });
+        yield return ("History pages can navigate backwards and change size without duplicates or new decrypts", async () =>
+        {
+            var (repository, counting) = Create(); Seed(repository, 81);
+            var session = new HistorySearchSession(repository, "default");
+            var filter = new HistoryFilter { Scene = "生日", FillStatus = "已预填" };
+            var first = await session.SearchAsync(filter, 0, 40);
+            var second = await session.SearchAsync(filter, 40, 40);
+            var last = await session.SearchAsync(filter, 80, 40);
+            Equal(1, last.Records.Count); Equal(false, last.HasMore); Equal(81, last.TotalMatches);
+            True(!first.Records.Select(x => x.Id).Intersect(second.Records.Select(x => x.Id)).Any(), "pages overlap");
+            var reads = counting.Reads;
+            var back = await session.SearchAsync(filter, 0, 40);
+            True(first.Records.Select(x => x.Id).SequenceEqual(back.Records.Select(x => x.Id)), "back navigation changed order");
+            Equal(20, (await session.SearchAsync(filter, 0, 20)).Records.Count);
+            Equal(reads, counting.Reads);
+            Equal(0, (await session.SearchAsync(filter with { Contact = "missing" }, 0, 20)).Records.Count);
         });
         yield return ("History read and decrypt work runs outside the calling UI thread", () =>
         {

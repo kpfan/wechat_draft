@@ -60,7 +60,7 @@ internal static class TemplateLocatorChecks
         });
     }
 
-    private static Bitmap Fixture(uint dpi, bool duplicate)
+    internal static Bitmap Fixture(uint dpi, bool duplicate)
     {
         var result = new Bitmap(1100, 800, PixelFormat.Format32bppArgb); result.SetResolution(96, 96);
         using var graphics = Graphics.FromImage(result);

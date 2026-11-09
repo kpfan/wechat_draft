@@ -45,11 +45,11 @@ public sealed class WechatSentGreetingMonitor : IDisposable
     public event Action<SendObservation>? Observed;
     public event Action<string>? StatusChanged;
 
-    public static async Task<WechatSentGreetingMonitor> StartAsync(nint target, AppSettings settings,
-        IWindowVisionModel model, ISecretProtector protector, CancellationToken ct)
+    public static async Task<WechatSentGreetingMonitor> StartAsync(nint target, CancellationToken ct)
     {
-        using var adapter = new WechatVisionAdapter(target, 0, false, settings, model, protector);
+        using var adapter = new WechatVisionAdapter(target);
         await adapter.CheckLayoutAsync(ct);
+        await adapter.ReadLocalTitleAsync(ct);
         ct.ThrowIfCancellationRequested();
         var baseline = adapter.CopyObservationBaseline();
         using var image = baseline.Image;
@@ -226,7 +226,7 @@ public sealed class WechatSentGreetingMonitor : IDisposable
             !_frame.Matches(new Rectangle(afterPoint.X, afterPoint.Y, afterBounds.Width, afterBounds.Height), Native.GetDpiForWindow(_target)))
             throw new InvalidOperationException("采集期间微信目标或布局变化，记录已停止。");
         using var stream = new MemoryStream(); composite.Save(stream, ImageFormat.Png);
-        return new(new Capture("chat", stream.ToArray()), Environment.TickCount64);
+        return new(new Capture("chat", stream.ToArray(), RequiresConversationCheck: true), Environment.TickCount64);
     }
 
     private Bitmap CaptureRegion(Rectangle local)

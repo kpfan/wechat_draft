@@ -141,6 +141,7 @@ public sealed record ModelResponse
     [JsonPropertyName("context_sufficient")] public bool ContextSufficient { get; init; }
     [JsonPropertyName("needs_more_context")] public bool NeedsMoreContext { get; init; }
     [JsonPropertyName("observed_display_name")] public string? ObservedDisplayName { get; init; }
+    [JsonPropertyName("conversation_type")] public string ConversationType { get; init; } = "unknown";
     [JsonPropertyName("relationship_type")] public string RelationshipType { get; init; } = "unknown";
     [JsonPropertyName("identity_label")] public string? IdentityLabel { get; init; }
     [JsonPropertyName("address_term")] public string? AddressTerm { get; init; }
@@ -149,9 +150,9 @@ public sealed record ModelResponse
     [JsonPropertyName("warnings")] public string[] Warnings { get; init; } = [];
 }
 
-public sealed record Capture(string Id, byte[] PngBytes);
+public sealed record Capture(string Id, byte[] PngBytes, bool RequiresConversationCheck = false, string? LocalTitle = null);
 public sealed record ConversationSnapshot(string SessionToken, string DisplayName, string OriginalText,
-    string WindowIdentity, bool IsDemo, object? NativeState = null, bool OriginalTextRead = true);
+    string WindowIdentity, bool IsDemo, object? NativeState = null, bool OriginalTextRead = true, bool DisplayNameRead = true, string TitleSource = "uia");
 public sealed record FillResult(string Status, string Message, bool? OriginalPreserved = null);
 public sealed record TaskProgress(string Stage, string Detail, int Percent);
 
@@ -184,4 +185,7 @@ public interface IGreetingModel
 {
     Task<ModelResponse> GenerateAsync(AppSettings settings, string apiKey, IReadOnlyList<Capture> captures,
         Contact? contact, IReadOnlyList<BlessingExample> examples, bool finalRound, CancellationToken cancellationToken);
+    Task<ModelResponse> GenerateAsync(AppSettings settings, string apiKey, IReadOnlyList<Capture> captures,
+        Contact? contact, IReadOnlyList<BlessingExample> examples, bool finalRound, GreetingGenerationContext context,
+        CancellationToken cancellationToken) => GenerateAsync(settings, apiKey, captures, contact, examples, finalRound, cancellationToken);
 }

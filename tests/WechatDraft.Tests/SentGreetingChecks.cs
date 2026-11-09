@@ -19,6 +19,18 @@ internal static class SentGreetingChecks
     public static IEnumerable<(string Name, Func<Task> Run)> Cases(string root, ISecretProtector protector)
     {
         LocalRepository Repository() => new(Path.Combine(root, "sent-" + Guid.NewGuid().ToString("N")), protector);
+        yield return ("Local visual send observations require explicit single-chat confirmation before archiving text", async () =>
+        {
+            foreach (var type in new[] { "single", "unknown", "group", "service" })
+            {
+                var repo = Repository(); var observation = Observation();
+                observation = observation with { Before = observation.Before with { RequiresConversationCheck = true } };
+                var record = await new SentGreetingArchiver(repo, protector, new FakeSentModel(Good() with { ConversationType = type }))
+                    .ProcessAsync(Configuration, observation, default);
+                Equal(type == "single" ? "已记录" : "待确认", record!.Status);
+                if (type != "single") { Equal("", record.Text); Equal(0, repo.Contacts("default").Count); }
+            }
+        });
         yield return ("Self-written sent blessings are archived without a generation task and preserve final text", async () =>
         {
             var repo = Repository(); const string text = "  我自己写的祝福：\r\n愿你新岁安康，事事顺心🎂！  ";

@@ -30,6 +30,12 @@ foreach (var (name, run) in ApiProfileChecks.Cases(root, protector)) await Test(
 foreach (var (name, run) in SentGreetingChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in ExampleChecks.Cases(examplePath)) await Test(name, run);
 foreach (var (name, run) in HistorySearchChecks.Cases(root, protector)) await Test(name, run);
+foreach (var (name, run) in LocalVisionChecks.Cases(root, examples, protector)) await Test(name, run);
+foreach (var (name, run) in VisionClipboardPollerChecks.Cases()) await Test(name, run);
+foreach (var (name, run) in VisionInputSettlerChecks.Cases()) await Test(name, run);
+foreach (var (name, run) in VisionInputRecheckChecks.Cases(root)) await Test(name, run);
+foreach (var (name, run) in OcrPrefillChecks.Cases(root, examples, protector)) await Test(name, run);
+foreach (var (name, run) in GreetingDiversityChecks.Cases(root, examples, protector)) await Test(name, run);
 LocalRepository ContactRepository() => new(Path.Combine(root, "contacts-" + Guid.NewGuid().ToString("N")), protector);
 AppSettings RealSettings() => settings with { DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
 AddressEvidence ChatAddress(string quote, string captureId = "capture_0") => new() { Source = "chat_message", Speaker = "self", Quote = quote, CaptureId = captureId };
@@ -179,7 +185,7 @@ await Test("Repeated real tasks reuse the same unconfirmed contact and history r
     var contacts = ContactRepository(); var coordinator = new TaskCoordinator(contacts, examples, protector);
     var firstModel = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "陈老师，生日快乐，愿您平安顺心！", RelationshipType = "teacher", IdentityLabel = "导师", AddressTerm = "陈老师", AddressEvidence = ChatAddress("陈老师，最近还好吗？"), ContextSufficient = true } };
     var first = await coordinator.RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, firstModel, null, default);
-    var secondModel = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "陈老师，生日快乐，愿您平安顺心！", RelationshipType = "friend", IdentityLabel = "朋友", AddressTerm = "小陈", ContextSufficient = true } };
+    var secondModel = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "陈老师，生日快乐！愿您忙里有闲，往后常遇舒心的人与事。", RelationshipType = "friend", IdentityLabel = "朋友", AddressTerm = "小陈", ContextSufficient = true } };
     var second = await coordinator.RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, secondModel, null, default);
     Equal("成功", first!.GenerationStatus); Equal("已预填", second!.FillStatus);
     Equal(false, first.ContactReused); Equal(true, second.ContactReused);
@@ -477,7 +483,7 @@ await Test("Enabling append after screenshot-only generation cannot promote an u
     var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
     Equal("成功", result!.GenerationStatus); Equal("待手动处理", result.FillStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
     using var client = new CompatibleModelClient(new StubHandler(_ => throw new Exception("must not call")));
-    using var visual = new WechatVisionAdapter(0, 0, true, settings, client, protector);
+    using var visual = new WechatVisionAdapter(0);
     var rejected = await visual.AppendAsync(new("s", "联系人", "", "w", false, OriginalTextRead: false), "祝福", default);
     Equal("待手动处理", rejected.Status);
 });
@@ -1005,7 +1011,7 @@ await Test("Fallback only activates for unavailable UIA and records the selected
     var visual = new FakeAdapter { AutomationMethod = "vision", LayoutApiCallCount = 4, CanAutoAppend = false,
         AutoAppendUnavailableReason = "视觉生成不能复查 UIA 会话标识，未预填。" };
     using var adapter = new FallbackConversationAdapter(primary, () => visual);
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings with { DemoMode = false, EnableLiveAppend = true,
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings with { DemoMode = false, EnableLiveAppend = true,
         BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example" }, adapter,
         new FakeModel { ObservedName = "测试联系人" }, null, default);
     Equal("vision", result!.AutomationMethod); Equal("UIA absent", result.FallbackReason); Equal(4, result.LayoutApiCallCount); Equal(0, visual.Appends);
@@ -1125,7 +1131,11 @@ sealed class FakeAdapter : IConversationAdapter
     public Func<CancellationToken, Task<bool>>? WaitForAppend { get; set; }
     public bool IsDemo { get; init; } = true;
     public bool OriginalTextRead { get; init; } = true;
+    public bool DisplayNameRead { get; init; } = true;
+    public string DisplayName { get; init; } = "测试联系人";
+    public string TitleSource { get; init; } = "uia";
     public bool CanCollectMoreContext { get; init; } = true;
+    public bool RequiresConversationCheck { get; init; }
     public int Scrolls;
     public Exception? BeginError { get; init; }
     public int BeginDelayMs { get; init; }
@@ -1136,9 +1146,9 @@ sealed class FakeAdapter : IConversationAdapter
         OnBegin?.Invoke();
         if (BeginError is not null) throw BeginError;
         if (BeginDelayMs > 0) await Task.Delay(BeginDelayMs, ct);
-        return new ConversationSnapshot("session", "测试联系人", "original", "window", IsDemo, OriginalTextRead: OriginalTextRead);
+        return new ConversationSnapshot("session", DisplayName, "original", "window", IsDemo, OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource);
     }
-    public Task<Capture> CaptureAsync(ConversationSnapshot s, int index, CancellationToken ct) => Task.FromResult(new Capture("capture_" + index, [(byte)index]));
+    public Task<Capture> CaptureAsync(ConversationSnapshot s, int index, CancellationToken ct) => Task.FromResult(new Capture("capture_" + index, [(byte)index], RequiresConversationCheck, TitleSource == "ocr" ? DisplayName : null));
     public Task<bool> ScrollUpAsync(ConversationSnapshot s, CancellationToken ct) { Scrolls++; return Task.FromResult(true); }
     public Task<bool> IsUnchangedAsync(ConversationSnapshot s, CancellationToken ct) => Task.FromResult(Valid);
     public Task<bool> WaitForAppendReadyAsync(ConversationSnapshot s, CancellationToken ct) => WaitForAppend?.Invoke(ct) ?? Task.FromResult(true);

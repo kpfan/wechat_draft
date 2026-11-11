@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
 using WechatDraft.Core;
 
@@ -22,6 +23,26 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern bool ClientToScreen(nint hwnd, ref Point point);
     [DllImport("user32.dll")] internal static extern bool IsClipboardFormatAvailable(uint format);
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int index);
+
+    internal static INPUT[] PrepareUnicodeInput(string text)
+    {
+        if (text.Length is 0 or > 4096 || text.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029'))
+            throw new InvalidOperationException("祝福正文无法直接输入，已保留正文供手动处理。");
+
+        // VK_PACKET carries text. In particular, this batch contains no Enter, paste, or copy key.
+        var inputs = new INPUT[text.Length * 2];
+        for (var i = 0; i < text.Length; i++)
+        {
+            var input = new INPUT { Type = 1, Data = new InputUnion
+            {
+                Keyboard = new KeyboardInput { Scan = text[i], Flags = 0x4, ExtraInfo = VisionInputTag }
+            } };
+            inputs[2 * i] = input;
+            input.Data.Keyboard.Flags |= 0x2;
+            inputs[2 * i + 1] = input;
+        }
+        return inputs;
+    }
 
     internal static void VisionChord(ushort key)
     {
@@ -56,8 +77,27 @@ internal static partial class Native
             SendInput(1, new[] { release }, Marshal.SizeOf<INPUT>());
         }
     }
-    internal static void VisionWheel(int delta) => Keys(new INPUT
-    { Type = 0, Data = new InputUnion { Mouse = new MouseInput { Flags = 0x800, MouseData = unchecked((uint)delta), ExtraInfo = VisionInputTag } } });
+    internal static void VisionPage(ushort key, int presses)
+    {
+        if (key is not (0x21 or 0x22)) throw new InvalidOperationException("不允许的翻页按键。");
+        var down = Key(key);
+        var up = Key(key, true);
+        down.Data.Keyboard.Flags |= 1; // Extended navigation key, not the numeric keypad.
+        up.Data.Keyboard.Flags |= 1;
+        down.Data.Keyboard.ExtraInfo = up.Data.Keyboard.ExtraInfo = VisionInputTag;
+        var keys = new INPUT[presses * 2];
+        for (var i = 0; i < keys.Length; i += 2)
+        {
+            keys[i] = down;
+            keys[i + 1] = up;
+        }
+        try { Keys(keys); }
+        catch
+        {
+            SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
+            throw;
+        }
+    }
 }
 
 internal sealed class VisionInputMonitor : IDisposable
@@ -76,9 +116,10 @@ internal sealed class VisionInputMonitor : IDisposable
     public string? LastActivity => _state.LastActivity;
     public string LastActivityDescription => _state.LastActivityDescription;
 
-    public VisionInputMonitor(nint target, bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true, nint companion = 0)
+    public VisionInputMonitor(nint target, bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true,
+        nint companion = 0, bool trackWheelActivity = true)
     {
-        _state = new VisionInteractionState(stopOnWheel, stopOnClick, stopOnKeyboard);
+        _state = new VisionInteractionState(stopOnWheel, stopOnClick, stopOnKeyboard, trackWheelActivity: trackWheelActivity);
         _keyboard = (code, message, data) =>
         {
             if (code >= 0 && message is 0x100 or 0x104)

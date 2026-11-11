@@ -1,22 +1,20 @@
 namespace WechatDraft.Core;
 
 // A title is scoped visible evidence, not a permanent contact identity.
-public sealed class OcrPrefillGuard(string title, string originalText)
+public sealed class OcrPrefillGuard(string title)
 {
     public string Title { get; } = ValidateTitle(title);
-    public string OriginalText { get; } = originalText;
     private string _reason = "";
-    private int _pasteIssued;
+    private int _writeIssued;
     public string Reason => Volatile.Read(ref _reason);
-    public bool PasteIssued => Volatile.Read(ref _pasteIssued) != 0;
+    public bool WriteIssued => Volatile.Read(ref _writeIssued) != 0;
     public bool Valid => Reason.Length == 0;
 
     public bool CheckTitle(string current) => Valid && (current.Trim() == Title || Reject("OCR 聊天标题已变化，未继续预填。"));
-    public bool CheckDraft(string current) => Valid && (current == OriginalText || Reject("微信原草稿已变化，未继续预填。"));
     public bool Reject(string reason) { Interlocked.CompareExchange(ref _reason, reason, ""); return false; }
-    public bool TryIssuePaste()
+    public bool TryIssueWrite()
     {
-        return Valid && Interlocked.CompareExchange(ref _pasteIssued, 1, 0) == 0 && Valid;
+        return Valid && Interlocked.CompareExchange(ref _writeIssued, 1, 0) == 0 && Valid;
     }
     public static string ValidateTitle(string title)
     {

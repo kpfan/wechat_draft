@@ -41,6 +41,7 @@ id_dsa
 *.p12
 *.pem
 *.key
+*.wdc
 
 # Temporary files and archives
 *.tmp

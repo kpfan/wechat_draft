@@ -77,6 +77,27 @@ internal static class VisionInteractionChecks
             focus.Mouse(0x20A, false); focus.Foreground(2, 2, 1);
             Equal(true, focus.Changed); Equal("foreground-change", focus.Reason);
         });
+        yield return ("Visual prefill keeps its input version while scrolling and detects real clicks and keys", () =>
+        {
+            var time = new InputClock();
+            var state = new VisionInteractionState(false, false, false, time, trackWheelActivity: false);
+            var before = state.ActivityVersion;
+            time.Advance(150);
+            state.Mouse(0x20A, false);
+            state.Mouse(0x20E, false);
+            Equal(true, state.WheelObserved);
+            Equal(false, state.Changed);
+            Equal(before, state.ActivityVersion);
+            Equal(TimeSpan.FromMilliseconds(150), state.QuietFor);
+
+            state.Keyboard(false);
+            state.Mouse(0x20A, false);
+            Equal(before + 1, state.ActivityVersion);
+            Equal("keyboard-input", state.LastActivity);
+            state.Mouse(0x201, false);
+            Equal(before + 2, state.ActivityVersion);
+            Equal("mouse-click", state.LastActivity);
+        });
         yield return ("UIA raw clicks and keys track activity without invalidating an unchanged task", () =>
         {
             var state = new VisionInteractionState(stopOnWheel: false, stopOnClick: false, stopOnKeyboard: false);
@@ -119,13 +140,40 @@ internal static class VisionInteractionChecks
             missing.Unavailable(); missing.ObserveConversation(identity);
             Equal(true, missing.Changed); Equal("uia-state-unavailable", missing.Reason);
         });
+        yield return ("Visual paging infers the bottom scrollbar position from input geometry and DPI", () =>
+        {
+            Equal(new Point(582, 416), VisionMessageScroll.BottomThumbPoint(new Rectangle(60, 448, 524, 100), 192));
+            Equal(new Point(291, 208), VisionMessageScroll.BottomThumbPoint(new Rectangle(30, 224, 262, 50), 96));
+            Equal(new Point(582, 456), VisionMessageScroll.BottomThumbPoint(new Rectangle(60, 488, 524, 100), 192));
+        });
+        yield return ("Visual paging measures shifted message rows and ignores empty panes", () =>
+        {
+            const int width = 100, height = 200, shift = 130;
+            var before = new byte[width * height * 4];
+            for (var y = 0; y < height; y++)
+                for (var x = 0; x < width; x++)
+                {
+                    var i = (y * width + x) * 4;
+                    before[i] = (byte)y;
+                    before[i + 1] = (byte)x;
+                }
+            var after = new byte[before.Length];
+            before.AsSpan(0, width * (height - shift) * 4).CopyTo(after.AsSpan(width * shift * 4));
+            var original = new VisionRegionSnapshot(width, height, before);
+            var scrolled = new VisionRegionSnapshot(width, height, after);
+            var empty = new VisionRegionSnapshot(width, height, new byte[before.Length]);
+            Equal(shift, VisionMessageScroll.EstimateDownwardShift(original, scrolled));
+            Equal(0, VisionMessageScroll.EstimateDownwardShift(original, empty));
+            Equal(0, VisionMessageScroll.EstimateDownwardShift(original, original));
+        });
         yield return ("Read-only context retains startup pixels after source changes and excludes the draft panel", () =>
         {
             var frame = new VisionWindowFrame(new Rectangle(200, 100, 200, 200), 192);
             var layout = new VisionLayout
             {
                 Header = new() { X = 0, Y = 0, Width = 1000, Height = 100 },
-                Messages = new() { X = 0, Y = 100, Width = 1000, Height = 600 }
+                Messages = new() { X = 0, Y = 100, Width = 1000, Height = 600 },
+                Input = new() { X = 0, Y = 700, Width = 1000, Height = 300 }
             };
             using var source = new Bitmap(200, 200);
             using (var graphics = Graphics.FromImage(source))
@@ -142,11 +190,10 @@ internal static class VisionInteractionChecks
             if (!before.PngBytes.AsSpan().SequenceEqual(after.PngBytes)) throw new Exception("Desktop changes entered the frozen context.");
             using var stream = new MemoryStream(after.PngBytes);
             using var result = new Bitmap(stream);
-            Equal(Color.Blue.ToArgb(), result.GetPixel(30, 30).ToArgb());
-            Equal(Color.Green.ToArgb(), result.GetPixel(30, result.Height - 30).ToArgb());
+            Equal(new Size(200, 120), result.Size);
             for (var y = 0; y < result.Height; y++)
                 for (var x = 0; x < result.Width; x++)
-                    if (result.GetPixel(x, y).ToArgb() == Color.Red.ToArgb()) throw new Exception("Draft panel entered greeting context.");
+                    Equal(Color.Green.ToArgb(), result.GetPixel(x, y).ToArgb());
         });
     }
 

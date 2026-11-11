@@ -19,11 +19,7 @@ static class ClipboardNativeChecks
     private static void Check()
     {
         using var backend = new NativeClipboardBackend(0);
-        NativeClipboardSnapshot original;
-        Open(backend);
-        uint sequence;
-        try { original = NativeClipboardSnapshot.Capture(); sequence = backend.Sequence; }
-        finally { backend.Close(); }
+        var original = Capture(backend, out var sequence);
         using (original)
         {
             var touched = false;
@@ -40,10 +36,7 @@ static class ClipboardNativeChecks
             }
             void RoundTrip(string name)
             {
-                NativeClipboardSnapshot before;
-                Open(backend);
-                try { before = NativeClipboardSnapshot.Capture(); sequence = backend.Sequence; }
-                finally { backend.Close(); }
+                var before = Capture(backend, out sequence);
                 using (before)
                 {
                     using (var session = new ClipboardSession(backend.OwnerWindow))
@@ -55,13 +48,8 @@ static class ClipboardNativeChecks
                     // If the user copied during the session, leave that new copy intact and stop.
                     if (backend.OwnerProcess != Environment.ProcessId) throw new Exception("External clipboard change; test stopped");
                     sequence = backend.Sequence;
-                    Open(backend);
-                    try
-                    {
-                        using var after = NativeClipboardSnapshot.Capture(); sequence = backend.Sequence;
-                        Same(before, after);
-                    }
-                    finally { backend.Close(); }
+                    using var after = Capture(backend, out sequence);
+                    Same(before, after);
                     Console.WriteLine("PASS native " + name);
                 }
             }
@@ -102,17 +90,52 @@ static class ClipboardNativeChecks
                 finally { foreach (var entry in images) entry.Dispose(); }
 
                 Publish([]); RoundTrip("empty clipboard");
+                void RejectWithoutChange(string name)
+                {
+                    try
+                    {
+                        using var unsupported = new ClipboardSession(backend.OwnerWindow);
+                        throw new Exception("Unrestorable file clipboard was accepted");
+                    }
+                    catch (InvalidOperationException)
+                    {
+                        if (backend.Sequence != sequence) throw new Exception("Rejected file clipboard changed");
+                    }
+                    Console.WriteLine("PASS native " + name);
+                }
                 var virtualFile = Global(Native.RegisterClipboardFormat("FileGroupDescriptorW"), new byte[32]);
                 try
                 {
                     Publish([virtualFile]);
-                    var rejected = false;
-                    try { using var unsupported = new ClipboardSession(backend.OwnerWindow); }
-                    catch (InvalidOperationException) { rejected = true; }
-                    if (!rejected || backend.Sequence != sequence) throw new Exception("Virtual-file rejection altered clipboard");
-                    Console.WriteLine("PASS native unsupported virtual file leaves clipboard unchanged");
+                    RejectWithoutChange("unsupported virtual file leaves clipboard unchanged");
                 }
                 finally { virtualFile.Dispose(); }
+                var folder = Directory.CreateTempSubdirectory("WechatDraft-clipboard-test-");
+                var paths = new[] { Path.Combine(folder.FullName, "测试甲.txt"), Path.Combine(folder.FullName, "test-b.txt") };
+                try
+                {
+                    foreach (var path in paths) File.WriteAllText(path, "synthetic file");
+                    foreach (var selection in new[] { paths[..1], paths })
+                    {
+                        var files = FileCopy(selection);
+                        try
+                        {
+                            Publish(files);
+                            RoundTrip("file paths and descriptors");
+                            var restoredPaths = System.Windows.Forms.Clipboard.GetFileDropList().Cast<string>();
+                            if (!selection.SequenceEqual(restoredPaths)) throw new Exception("Restored file list differs");
+                            using var stream = Global(Native.RegisterClipboardFormat("FileContents"), [1, 2, 3]);
+                            Publish([.. files, stream]);
+                            RejectWithoutChange("file paths do not permit a mixed FileContents payload");
+                        }
+                        finally { foreach (var entry in files) entry.Dispose(); }
+                    }
+                }
+                finally
+                {
+                    foreach (var path in paths) File.Delete(path);
+                    folder.Delete();
+                }
                 // Exercise OLE delayed-data materialization using synthetic .NET rich text.
                 if (backend.Sequence != sequence) throw new Exception("External clipboard change; test stopped");
                 var ole = new System.Windows.Forms.DataObject();
@@ -127,22 +150,58 @@ static class ClipboardNativeChecks
                 if (touched && backend.Sequence == sequence)
                 {
                     using var restore = original.PrepareRestore(); Open(backend);
+                    var restoredOriginal = false;
                     try
                     {
                         if (backend.Sequence == sequence)
                         {
                             backend.Empty(); restore.Commit();
-                            using var restored = NativeClipboardSnapshot.Capture(); Same(original, restored);
-                            Console.WriteLine("PASS native original user clipboard restored (contents not logged)");
+                            restoredOriginal = true;
                         }
                     }
                     finally { backend.Close(); }
+                    if (restoredOriginal)
+                    {
+                        using var restored = Capture(backend, out sequence);
+                        Same(original, restored);
+                        Console.WriteLine("PASS native original user clipboard restored (contents not logged)");
+                    }
                 }
             }
         }
     }
 
     private static ClipboardEntry Global(uint format, byte[] bytes) => new(format, ClipboardStorage.Global, bytes, 0, default, bytes.Length);
+
+    private static ClipboardEntry[] FileCopy(string[] paths)
+    {
+        const int dropHeader = 20, descriptorSize = 592, nameOffset = 72;
+        var pathBytes = Encoding.Unicode.GetBytes(string.Join('\0', paths) + "\0\0");
+        var drop = new byte[dropHeader + pathBytes.Length];
+        BitConverter.GetBytes(dropHeader).CopyTo(drop, 0);
+        BitConverter.GetBytes(1).CopyTo(drop, 16);
+        pathBytes.CopyTo(drop, dropHeader);
+        var descriptors = new byte[4 + paths.Length * descriptorSize];
+        BitConverter.GetBytes(paths.Length).CopyTo(descriptors, 0);
+        for (var i = 0; i < paths.Length; i++)
+            Encoding.Unicode.GetBytes(Path.GetFileName(paths[i])).CopyTo(descriptors, 4 + i * descriptorSize + nameOffset);
+        return [Global(15, drop), Global(Native.RegisterClipboardFormat("FileGroupDescriptorW"), descriptors),
+            Global(Native.RegisterClipboardFormat("Preferred DropEffect"), BitConverter.GetBytes(1))];
+    }
+
+    private static NativeClipboardSnapshot Capture(NativeClipboardBackend backend, out uint sequence)
+    {
+        backend.PrepareCapture();
+        Open(backend);
+        try
+        {
+            var snapshot = (NativeClipboardSnapshot)backend.Capture();
+            sequence = backend.Sequence;
+            return snapshot;
+        }
+        finally { backend.Close(); }
+    }
+
     private static void Open(IClipboardBackend backend)
     {
         for (var i = 0; i < 5; i++) { if (backend.Open()) return; Thread.Sleep(20); }

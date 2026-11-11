@@ -31,7 +31,12 @@ internal sealed class DemoGreetingModel : IGreetingModel
         Contact? contact, IReadOnlyList<BlessingExample> examples, bool finalRound, CancellationToken cancellationToken)
     {
         await Task.Delay(1100, cancellationToken);
-        var text = examples.FirstOrDefault()?.Text ?? $"{settings.Scene}快乐！愿你在接下来的日子里平安顺心，忙碌之余也有轻松与欢笑，每一天都有值得期待的小事。";
+        var text = (settings.Scene.Trim(), HolidayZodiac.Resolve(settings)) switch
+        {
+            ("春节", { } zodiac) => $"新春快乐！愿你{zodiac}平安顺心，家人安康，日子越过越好。",
+            ("元旦", { } zodiac) => $"元旦快乐！愿新的一年平安顺遂，也愿即将到来的{zodiac}常有好事发生。",
+            _ => examples.FirstOrDefault()?.Text ?? $"{settings.Scene}快乐！愿你在接下来的日子里平安顺心，忙碌之余也有轻松与欢笑，每一天都有值得期待的小事。"
+        };
         var address = contact?.AddressTerm;
         text = string.IsNullOrWhiteSpace(address) ? text.Replace("{称呼}，", "").Replace("{称呼}", "") : text.Replace("{称呼}", address);
         if (!string.IsNullOrWhiteSpace(address) && !text.StartsWith(address.Trim(), StringComparison.Ordinal)) text = address.Trim() + "，" + text;

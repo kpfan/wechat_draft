@@ -8,8 +8,9 @@
     <EnableMsixTooling>true</EnableMsixTooling>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
     <SelfContained>false</SelfContained>
-    <AppHostDotNetSearch>AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
-    <AppHostRelativeDotNet>../../.tools/dotnet</AppHostRelativeDotNet>
+    <AppHostDotNetSearch Condition="'$(SelfContained)' == 'true'">AppLocal</AppHostDotNetSearch>
+    <AppHostDotNetSearch Condition="'$(SelfContained)' != 'true'">AppRelative;EnvironmentVariable;Global</AppHostDotNetSearch>
+    <AppHostRelativeDotNet Condition="'$(SelfContained)' != 'true'">../../.tools/dotnet</AppHostRelativeDotNet>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>WechatDraft</AssemblyName><RootNamespace>WechatDraft.App</RootNamespace>
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>

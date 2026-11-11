@@ -72,29 +72,6 @@ public sealed class LocalRepository
     public List<TaskRecord> History(string? scope, int limit = 200) => Read<TaskRecord>(scope is null
         ? "SELECT payload FROM tasks ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000)
         : "SELECT payload FROM tasks WHERE scope=$scope ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000), scope);
-    public IReadOnlyList<string> RecentGreetings(string scope, string? contactId, string displayName, string scene,
-        bool isDemo, CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(displayName)) return [];
-        using var db = Open(); using var command = db.CreateCommand();
-        command.CommandText = "SELECT payload FROM tasks WHERE scope=$scope ORDER BY created DESC,id DESC LIMIT 200";
-        command.Parameters.AddWithValue("$scope", scope);
-        using var reader = command.ExecuteReader();
-        var result = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal);
-        while (reader.Read())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var task = Decode<TaskRecord>(reader.GetString(0));
-            var sameContact = !string.IsNullOrEmpty(contactId) && !string.IsNullOrEmpty(task.ContactId)
-                ? task.ContactId == contactId : task.DisplayName.Trim() == displayName.Trim();
-            if (!sameContact || task.IsDemo != isDemo || task.Scene.Trim() != scene.Trim() ||
-                task.GenerationStatus != "成功" || string.IsNullOrWhiteSpace(task.Greeting)) continue;
-            if (seen.Add(GreetingDiversity.Normalize(task.Greeting))) result.Add(task.Greeting);
-            if (result.Count == 5) break;
-        }
-        return result;
-    }
     public HistoryBatch ReadHistoryBatch(string scope, HistoryCursor? before, int limit, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();

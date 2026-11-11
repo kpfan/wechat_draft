@@ -17,7 +17,7 @@ public sealed partial class MainWindow
     }
 
     private string PrefillHint() => _settings.EnableLiveAppend
-        ? "生成期间可以浏览本软件。填写时需回到原微信聊天，最多等待 30 秒，不抢占窗口；切换聊天、修改微信草稿或转到其他程序会停止预填。同一聊天且草稿未变化后在末尾追加，不会自动发送。"
+        ? "填写时请回到原微信聊天，最多等待 30 秒。视觉模式追加到当前草稿末尾，UIA 模式要求草稿保持一致。生成内容由你检查后手动发送。"
         : "只生成祝福，结果显示在助手中。开启后仅对新任务生效。";
 
     private void SavePrefillPreference()

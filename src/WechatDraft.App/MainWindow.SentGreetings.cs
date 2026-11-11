@@ -45,6 +45,7 @@ public sealed partial class MainWindow
         RefreshWindows();
         if (_settings.DemoMode || _windows?.SelectedItem is not WechatWindow window)
         { Notify("请关闭演示模式并选择目标微信窗口。", InfoBarSeverity.Warning); return; }
+        if (!await ConfirmScreenshotUploadAsync() || IsTaskBusy) return;
         StopSentRecording();
         _sentStarting = true;
         _runCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(_settings.TaskTimeoutSeconds, 10, 180)));
@@ -53,9 +54,6 @@ public sealed partial class MainWindow
         var configuration = _settings with { };
         try
         {
-            var origin = DraftRules.Origin(configuration);
-            if (configuration.AuthorizedOrigin != origin)
-                throw new InvalidDataException("请先在设置中授权必要聊天截图，再开启归档。");
             _sentMonitor = await WechatSentGreetingMonitor.StartAsync(window.Handle, _runCancellation.Token);
             _sentSession = CancellationTokenSource.CreateLinkedTokenSource(_sentShutdown.Token);
             var sessionToken = _sentSession.Token;

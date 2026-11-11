@@ -19,20 +19,16 @@ internal sealed class VisionContextSnapshot(Bitmap source) : IDisposable
     internal static Capture CreateCapture(Bitmap image, VisionWindowFrame frame, VisionLayout layout, int index)
     {
         frame.ValidateImageSize(image.Size);
-        var header = frame.ToClientRectangle(layout.Header!);
-        var messages = frame.ToClientRectangle(layout.Messages!);
-        var scale = Math.Min(4d, 1800d / header.Width);
-        var headerWidth = (int)(header.Width * scale);
-        var headerHeight = (int)(header.Height * scale);
-        using var composite = new Bitmap(Math.Max(messages.Width, headerWidth), messages.Height + headerHeight + 16);
-        using (var graphics = Graphics.FromImage(composite))
-        {
-            graphics.Clear(Color.White);
-            graphics.DrawImage(image, new Rectangle(0, 0, headerWidth, headerHeight), header, GraphicsUnit.Pixel);
-            graphics.DrawImage(image, new Rectangle(0, headerHeight + 16, messages.Width, messages.Height), messages, GraphicsUnit.Pixel);
-        }
+        if (layout.Header is null || layout.Messages is null || layout.Input is null)
+            throw new InvalidDataException("缺少消息区裁剪边界，未上传截图。");
+        var header = frame.ToClientRectangle(layout.Header);
+        var messages = frame.ToClientRectangle(layout.Messages);
+        var input = frame.ToClientRectangle(layout.Input);
+        if (messages.Top < header.Bottom || messages.Bottom > input.Top)
+            throw new InvalidDataException("消息区与标题或输入面板重叠，未上传截图。");
+        using var crop = image.Clone(messages, PixelFormat.Format32bppArgb);
         using var stream = new MemoryStream();
-        composite.Save(stream, ImageFormat.Png);
+        crop.Save(stream, ImageFormat.Png);
         return new($"vision_context_{index}", stream.ToArray());
     }
 

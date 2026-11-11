@@ -43,6 +43,16 @@ try
         Console.WriteLine(JsonSerializer.Serialize(new { formats = ClipboardDiagnostics.Formats() }));
         return 0;
     }
+    if (mode == "export-model-config")
+    {
+        if (args.Length != 4 || !File.Exists(Path.Combine(data, "drafts.db")))
+            throw new InvalidDataException("用法：export-model-config <源数据目录> <软件发布目录> <model-config.wdc 输出路径>");
+        var sourceProtector = new DpapiProtector();
+        var sourceSettings = new LocalRepository(data, sourceProtector).LoadSettings();
+        ModelConfigPackage.ExportDefault(sourceSettings, Path.GetFullPath(args[2]), Path.GetFullPath(args[3]), sourceProtector);
+        Console.WriteLine("已生成加密模型配置。分发与本次导出配套的软件包和 model-config.wdc。");
+        return 0;
+    }
     if (mode == "probe-interactive" &&
         (Path.TrimEndingDirectorySeparator(data).Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath("artifacts/app/data")), StringComparison.OrdinalIgnoreCase) ||
          File.Exists(Path.Combine(data, "drafts.db"))))

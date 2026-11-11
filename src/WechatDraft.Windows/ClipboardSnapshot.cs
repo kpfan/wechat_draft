@@ -36,7 +36,7 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
     internal const int MaximumFormats = 128;
     internal List<ClipboardEntry> Entries { get; } = new();
 
-    public static NativeClipboardSnapshot Capture()
+    public static NativeClipboardSnapshot Capture(FileClipboardCopy? fileCopy = null)
     {
         var snapshot = new NativeClipboardSnapshot(); long total = 0;
         try
@@ -59,19 +59,20 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
                     if (seen.Count >= MaximumFormats) throw new InvalidOperationException("剪贴板格式持续变化，未修改原内容。");
                     seen.Add(next);
                     if (next == 0x80 || next is >= 0x200 and <= 0x3ff)
-                        throw new InvalidOperationException("剪贴板包含无法独立恢复的应用专用对象，未修改原内容。");
+                        throw new ClipboardBackupUnavailableException("剪贴板包含无法独立恢复的应用专用对象，未修改原内容。");
                     var name = new StringBuilder(128); Native.GetClipboardFormatName(next, name, name.Capacity);
                     // OLE control channels are tied to the original owner, not user payload.
                     // Native formats are fully materialized; stale COM owner pointers must not be republished.
-                    if (name.ToString() is "DataObject" or "Ole Private Data" or "OleClipboardPersistOnFlush") continue;
-                    if (name.ToString() is "FileContents" or "FileGroupDescriptor" or "FileGroupDescriptorW")
-                        throw new InvalidOperationException("剪贴板含虚拟文件或流式对象，暂不支持完整恢复，未修改原内容。");
+                    if (FileClipboardCopy.IsOleControl(name.ToString())) continue;
+                    if (name.ToString() == "FileContents" || FileClipboardCopy.IsDescriptor(name.ToString()) && fileCopy is null)
+                        throw new ClipboardBackupUnavailableException(FileClipboardCopy.Unsupported);
                     var entry = Read(next, MaximumBytes - total);
                     snapshot.Entries.Add(entry); total += entry.Size;
                 }
             }
             if (seen.Count > 0 && snapshot.Entries.Count == 0)
-                throw new InvalidOperationException("剪贴板只有应用专用对象，未修改原内容。");
+                throw new ClipboardBackupUnavailableException("剪贴板只有应用专用对象，未修改原内容。");
+            fileCopy?.Validate(snapshot.Entries);
             return snapshot;
         }
         catch { snapshot.Dispose(); throw; }
@@ -129,7 +130,7 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
             default:
                 var length = Native.GlobalSize(handle);
                 if (length > MaximumItemBytes || length > (nuint)Math.Max(0, remaining) || Native.GlobalFlags(handle) == 0x8000)
-                    throw new InvalidOperationException("剪贴板数据过大或无法独立备份，未修改原内容。");
+                    throw new ClipboardBackupUnavailableException("剪贴板数据过大或无法独立备份，未修改原内容。");
                 size = (long)length; bytes = new byte[(int)length];
                 if (length > 0)
                 {
@@ -148,7 +149,7 @@ internal sealed class NativeClipboardSnapshot : IClipboardSnapshot
     private static void CheckSize(long size, long remaining)
     {
         if (size <= 0 || size > MaximumItemBytes || size > remaining)
-            throw new InvalidOperationException("剪贴板内容超过安全备份上限（单格式64MiB、总计128MiB），未修改原内容。");
+            throw new ClipboardBackupUnavailableException("剪贴板内容超过安全备份上限（单格式64MiB、总计128MiB），未修改原内容。");
     }
     public IClipboardWrite PrepareRestore() => NativeClipboardWrite.FromEntries(Entries);
     public void Dispose() { foreach (var entry in Entries) entry.Dispose(); Entries.Clear(); }
@@ -264,6 +265,7 @@ internal sealed class NativeClipboardBackend : IClipboardBackend
     private readonly nint _owner;
     private readonly bool _ownsWindow;
     private readonly uint _thread;
+    private FileClipboardCopy? _fileCopy;
     public NativeClipboardBackend(nint owner)
     {
         _thread = Native.GetCurrentThreadId();
@@ -281,7 +283,8 @@ internal sealed class NativeClipboardBackend : IClipboardBackend
     public void Close() => Native.CloseClipboard();
     public uint Sequence => Native.GetClipboardSequenceNumber();
     public uint OwnerProcess { get { Native.GetWindowThreadProcessId(Native.GetClipboardOwner(), out var pid); return pid; } }
-    public IClipboardSnapshot Capture() => NativeClipboardSnapshot.Capture();
+    public void PrepareCapture() => _fileCopy = FileClipboardCopy.Inspect();
+    public IClipboardSnapshot Capture() => NativeClipboardSnapshot.Capture(_fileCopy?.Sequence == Sequence ? _fileCopy : null);
     public IClipboardWrite PrepareText(string text) => NativeClipboardWrite.Text(text);
     public void Empty() { if (!Native.EmptyClipboard()) throw new InvalidOperationException("无法准备剪贴板，未继续操作微信。"); }
     public string ReadPlainText()

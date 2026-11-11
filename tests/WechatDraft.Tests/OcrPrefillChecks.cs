@@ -95,20 +95,18 @@ internal static class OcrPrefillChecks
             if (result!.GenerationStatus != "成功" || adapter.Appends != 0 || result.FillStatus != "待手动处理")
                 throw new Exception("An unread draft was promoted to a write.");
         });
-        yield return ("OCR guard permanently rejects changed titles and exact whitespace changes", () =>
+        yield return ("OCR guard permanently rejects changed titles", () =>
         {
-            var guard = new OcrPrefillGuard("测试", " 原文\r\n");
-            if (!guard.CheckTitle("测试") || !guard.CheckDraft(" 原文\r\n")) throw new Exception("Baseline rejected.");
-            if (guard.CheckTitle("其他") || guard.CheckTitle("测试") || guard.TryIssuePaste()) throw new Exception("Changed title regained permission.");
-            guard = new("测试", " 原文\r\n");
-            if (guard.CheckDraft("原文\n") || guard.CheckDraft(" 原文\r\n") || guard.TryIssuePaste()) throw new Exception("Changed original regained permission.");
+            var guard = new OcrPrefillGuard("测试");
+            if (!guard.CheckTitle("测试")) throw new Exception("Baseline rejected.");
+            if (guard.CheckTitle("其他") || guard.CheckTitle("测试") || guard.TryIssueWrite()) throw new Exception("Changed title regained permission.");
             return Task.CompletedTask;
         });
         yield return ("Concurrent attempts can issue the OCR paste at most once and cannot retry uncertainty", async () =>
         {
-            var guard = new OcrPrefillGuard("测试", ""); var issued = 0;
-            await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => Task.Run(() => { if (guard.TryIssuePaste()) Interlocked.Increment(ref issued); })));
-            if (issued != 1 || !guard.PasteIssued || guard.TryIssuePaste()) throw new Exception("Uncertain paste replayed.");
+            var guard = new OcrPrefillGuard("测试"); var issued = 0;
+            await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => Task.Run(() => { if (guard.TryIssueWrite()) Interlocked.Increment(ref issued); })));
+            if (issued != 1 || !guard.WriteIssued || guard.TryIssueWrite()) throw new Exception("Uncertain paste replayed.");
         });
         yield return ("Local selection and empty-editor checks reject message selections and nonblank attachments", () =>
         {
@@ -360,16 +358,22 @@ internal static class OcrPrefillChecks
                 throw new Exception("Real draft text was normalized away.");
             return Task.CompletedTask;
         });
-        yield return ("OCR local title is authoritative in the HTTP protocol and model title is optional", async () =>
+        yield return ("Generation request keeps the local title and contact lookup names off the wire", async () =>
         {
             string body = "";
             var response = JsonSerializer.Serialize(new ModelResponse { GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" });
             var handler = new StubHandler(request => { body = request.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = response } } } })) }; });
             using var client = new CompatibleModelClient(handler);
-            await client.GenerateAsync(configuration, "", [new("c", [1], true, "测试联系人")], null, [], true, default);
+            const string localTitle = "PRIVATE_LOCAL_TITLE";
+            await client.GenerateAsync(configuration, "", [new("c", [1], true, localTitle)],
+                new Contact { Confirmed = true, DisplayName = localTitle, RemarkName = "PRIVATE_REMARK" }, [], true, default);
             using var json = JsonDocument.Parse(body);
             var messages = json.RootElement.GetProperty("messages");
+            using var prompt = JsonDocument.Parse(messages[1].GetProperty("content")[0].GetProperty("text").GetString()!);
+            if (!prompt.RootElement.GetProperty("recipient_checked_locally").GetBoolean() ||
+                body.Contains(localTitle, StringComparison.Ordinal) || body.Contains("PRIVATE_REMARK", StringComparison.Ordinal))
+                throw new Exception("Local title or contact lookup name entered the request.");
             var text = messages[1].GetProperty("content").EnumerateArray().Last().GetProperty("text").GetString()!;
             if (!text.Contains("不重新读取标题") || handler.Calls != 1) throw new Exception("Model still determined the OCR title.");
             try { DraftRules.ValidateConversation(new() { ObservedDisplayName = "普通人" }, [new("c", [1], true, "测试群(242)")]); }

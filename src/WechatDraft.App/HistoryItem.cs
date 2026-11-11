@@ -34,7 +34,7 @@ public sealed class HistoryItem
         if (record.ContactReused) details.Add("已按备注复用联系人档案");
         if (record.AutomationMethod is "uia" or "vision") details.Add(record.AutomationMethod == "vision" ? "纯视觉" : "UIA");
         if (record.FallbackReason.Length > 0) details.Add("视觉兜底原因：" + record.FallbackReason);
-        if (record.OriginalTextRead == false) details.Add("只采集截图 · 未读取草稿");
+        if (record.OriginalTextRead == false) details.Add("生成前未读取草稿");
         if (record.OriginalPreserved == true) details.Add($"已核对原文保留 · {record.OriginalCharacters} 个字符");
         if (record.Error.Length > 0 && record.Greeting.Length > 0) details.Add(record.Error);
         Details = string.Join(Environment.NewLine, details);

@@ -1,5 +1,6 @@
 using System;
 using System.Drawing;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using WechatDraft.Core;
@@ -9,6 +10,28 @@ namespace WechatDraft.Windows;
 // Geometry only. Toolbars and local edges do not prove chat identity, draft kind or single-chat state.
 internal static class WechatLocalLayout
 {
+    internal static bool CanReuseGeometry(Bitmap initial, Bitmap current, uint dpi, VisionLayout layout,
+        VisionAnchorHints anchors, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (initial.Size != current.Size ||
+            !SamePixels(initial, current, Pixels(anchors.TopToolbar, initial.Size)) ||
+            !SamePixels(initial, current, Pixels(anchors.BottomToolbar, initial.Size))) return false;
+        try
+        {
+            var checkedLayout = FromAnchors(current, dpi, anchors, ct);
+            return checkedLayout.Input!.Y == layout.Input!.Y;
+        }
+        catch (InvalidDataException) { return false; }
+    }
+
+    private static bool SamePixels(Bitmap initial, Bitmap current, Rectangle region) =>
+        VisionRegionSnapshot.Capture(initial, region).Matches(VisionRegionSnapshot.Capture(current, region), allowCaret: false);
+
+    private static Rectangle Pixels(VisionBox box, Size size) =>
+        Rectangle.FromLTRB((int)Math.Round(box.X * size.Width / 1000), (int)Math.Round(box.Y * size.Height / 1000),
+            (int)Math.Round(box.Right * size.Width / 1000), (int)Math.Round(box.Bottom * size.Height / 1000));
+
     internal static bool SameGeometry(VisionLayout baseline, VisionLayout current, int width, int height)
     {
         var a = new[] { baseline.Header, baseline.Input, baseline.Editor, baseline.Send, baseline.InputToolbar };
@@ -16,6 +39,20 @@ internal static class WechatLocalLayout
         return a.Zip(b).All(pair => pair.First is { } first && pair.Second is { } second &&
             Math.Abs(first.X - second.X) * width / 1000 <= 2 && Math.Abs(first.Y - second.Y) * height / 1000 <= 2 &&
             Math.Abs(first.Right - second.Right) * width / 1000 <= 2 && Math.Abs(first.Bottom - second.Bottom) * height / 1000 <= 2);
+    }
+
+    internal static bool ConfirmMessageGeometry(Bitmap initial, Bitmap current, VisionWindowFrame frame,
+        VisionLayout baseline, VisionAnchorHints anchors, CancellationToken ct)
+    {
+        if (CanReuseGeometry(initial, current, frame.Dpi, baseline, anchors, ct)) return true;
+        if (initial.Size != current.Size) return false;
+        var located = Locate(current, frame.Dpi, ct).Layout;
+        if (!SameGeometry(baseline, located, current.Width, current.Height)) return false;
+        var messages = frame.ToClientRectangle(baseline.Messages!);
+        var currentMessages = frame.ToClientRectangle(located.Messages!);
+        return messages.Left >= currentMessages.Left && messages.Right <= currentMessages.Right &&
+            messages.Top >= frame.ToClientRectangle(located.Header!).Bottom &&
+            messages.Bottom <= frame.ToClientRectangle(located.Input!).Top;
     }
 
     internal static (VisionLayout Layout, VisionAnchorHints Anchors) Locate(Bitmap image, uint dpi, CancellationToken ct)
@@ -34,10 +71,7 @@ internal static class WechatLocalLayout
             throw new System.IO.InvalidDataException("本地模板与窗口缩放不一致。");
         var scale = dpi / 96d;
         double Px(double value) => value * scale;
-        Rectangle Pixels(VisionBox box) => Rectangle.FromLTRB((int)Math.Round(box.X * image.Width / 1000),
-            (int)Math.Round(box.Y * image.Height / 1000), (int)Math.Round(box.Right * image.Width / 1000),
-            (int)Math.Round(box.Bottom * image.Height / 1000));
-        var top = Pixels(anchors.TopToolbar); var bottom = Pixels(anchors.BottomToolbar);
+        var top = Pixels(anchors.TopToolbar, image.Size); var bottom = Pixels(anchors.BottomToolbar, image.Size);
         var left = bottom.Left - (int)Px(16);
         var right = image.Width - (int)Px(8);
         var titleTop = Math.Max(0, top.Top - (int)Px(8));
@@ -47,8 +81,9 @@ internal static class WechatLocalLayout
             bottom.Right > right || messageTop >= bottom.Top)
             throw new System.IO.InvalidDataException("本地双锚点区域关系异常，未继续识别。");
         // Current WeChat puts the toolbar below the editor; older versions put it above.
-        // Find the actual input separator instead of adding a fixed offset below the toolbar.
-        var separator = FindSeparator(image, left, right, Math.Max(messageTop + (int)Px(80), image.Height * 2 / 5),
+        // A tall draft can put the separator above 40% of the window. Keep a usable
+        // message area below the header and scan upwards from the input toolbar.
+        var separator = FindSeparator(image, left, right, messageTop + (int)Px(80),
             bottom.Top - (int)Px(3), Math.Max(2, (int)Px(3)), ct);
         if (separator < 0) throw new System.IO.InvalidDataException("本地未找到可靠的消息区与输入区分界，请调整微信窗口后重试。未调用大模型定位。");
         var inputBottom = image.Height - (int)Px(8);
@@ -79,23 +114,115 @@ internal static class WechatLocalLayout
     private static int FindSeparator(Bitmap image, int left, int right, int start, int end, int gap, CancellationToken ct)
     {
         const int samples = 96;
+        const int edgeSamples = 4;
         var inset = (right - left) / 16;
-        for (var y = Math.Min(end, image.Height - gap - 1); y >= Math.Max(start, gap); y--)
+        var firstY = Math.Max(start, gap);
+        var lastY = Math.Min(end, image.Height - gap - 1);
+        if (lastY < firstY) return -1;
+        ct.ThrowIfCancellationRequested();
+        var spanWidth = right - left - inset * 2;
+        var region = new Rectangle(left, firstY - gap, right - left + 1, lastY - firstY + gap * 2 + 1);
+        var pixels = VisionRegionSnapshot.Capture(image, region).Data;
+        var stride = region.Width * 4;
+        var gapBytes = gap * stride;
+        Span<int> sampleOffsets = stackalloc int[samples];
+        for (var i = 0; i < samples; i++) sampleOffsets[i] = (inset + spanWidth * i / (samples - 1)) * 4;
+        var partlyObscured = -1;
+        var ambiguous = false;
+        var outlined = -1;
+        var outlineAmbiguous = false;
+        for (var y = lastY; y >= firstY; y--)
         {
             ct.ThrowIfCancellationRequested();
             var dark = 0; var light = 0;
-            for (var i = 0; i < samples; i++)
+            var darkBelow = 0; var lightBelow = 0;
+            var row = (y - region.Top) * stride;
+            foreach (var offset in sampleOffsets)
             {
-                var x = left + inset + (right - left - inset * 2) * i / (samples - 1);
-                var center = Gray(image.GetPixel(x, y));
-                var before = Gray(image.GetPixel(x, y - gap)); var after = Gray(image.GetPixel(x, y + gap));
-                if (center - before >= 3 && center - after >= 3) light++;
-                if (before - center >= 3 && after - center >= 3) dark++;
+                var index = row + offset;
+                var center = Gray(pixels, index);
+                var before = Gray(pixels, index - gapBytes); var after = Gray(pixels, index + gapBytes);
+                if (center - after >= 3)
+                {
+                    lightBelow++;
+                    if (center - before >= 3) light++;
+                }
+                else if (after - center >= 3)
+                {
+                    darkBelow++;
+                    if (before - center >= 3) dark++;
+                }
             }
             if (Math.Max(dark, light) >= samples * .85) return y;
+            if (Math.Max(darkBelow, lightBelow) >= 90 && y + 7 * gap <= lastY &&
+                HasEditorOutline(pixels, region.Width, row, gap, sampleOffsets, lightBelow >= darkBelow ? 1 : -1))
+            {
+                if (outlined < 0) outlined = y;
+                else if (outlined - y > gap) outlineAmbiguous = true;
+            }
+
+            // A message touching the divider can change the reference pixels above it.
+            var direction = light >= dark ? 1 : -1;
+            if (Math.Max(dark, light) < 72 || (direction > 0 ? lightBelow : darkBelow) < 90) continue;
+            var leftEdge = 0;
+            var rightEdge = 0;
+            for (var i = 0; i < edgeSamples; i++)
+            {
+                if (HasTwoSidedContrast(pixels, row + sampleOffsets[i], gapBytes, direction)) leftEdge++;
+                if (HasTwoSidedContrast(pixels, row + sampleOffsets[samples - 1 - i], gapBytes, direction)) rightEdge++;
+            }
+            if (leftEdge < 3 || rightEdge < 3) continue;
+            if (partlyObscured < 0) partlyObscured = y;
+            else if (partlyObscured - y > gap) ambiguous = true;
         }
-        return -1;
+        if (partlyObscured >= 0 && !ambiguous) return partlyObscured;
+        return outlineAmbiguous ? -1 : outlined;
     }
 
-    private static int Gray(Color color) => (color.R * 77 + color.G * 150 + color.B * 29) >> 8;
+    private static bool HasEditorOutline(byte[] pixels, int width, int row, int gap, ReadOnlySpan<int> sampleOffsets, int direction)
+    {
+        var stride = width * 4;
+        var tone = Gray(pixels, row + sampleOffsets[sampleOffsets.Length / 2]);
+        var matchingTop = 0;
+        foreach (var offset in sampleOffsets)
+        {
+            var center = Gray(pixels, row + offset);
+            if (Math.Abs(center - tone) <= 3 && direction * (center - Gray(pixels, row + offset + gap * stride)) >= 3)
+                matchingTop++;
+        }
+        if (matchingTop < 90) return false;
+
+        var probe = Math.Max(1, gap / 2);
+        bool Stroke(int x, int relativeY)
+        {
+            var index = row + relativeY * stride + x * 4;
+            return Math.Abs(Gray(pixels, index) - tone) <= 3 &&
+                HasTwoSidedContrast(pixels, index, probe * 4, direction);
+        }
+        bool Corner(int edge, int inward)
+        {
+            // Confirm a straight side below the top, and the rounded turn inward near it.
+            // A horizontal line within an existing editor cannot start both of its sides.
+            for (var offset = probe; offset <= 6 * gap; offset++)
+            {
+                var x = edge + inward * offset;
+                if (!Stroke(x, 3 * gap) || !Stroke(x, 5 * gap) || !Stroke(x, 7 * gap) ||
+                    Stroke(x, -gap) || Stroke(x, gap)) continue;
+                for (var shift = 1; shift <= 2 * gap; shift++)
+                    if (Stroke(x + inward * shift, gap)) return true;
+            }
+            return false;
+        }
+        return Corner(0, 1) && Corner(width - 1, -1);
+    }
+
+    private static bool HasTwoSidedContrast(byte[] pixels, int index, int distance, int direction)
+    {
+        var center = Gray(pixels, index);
+        return direction * (center - Gray(pixels, index - distance)) >= 3 &&
+            direction * (center - Gray(pixels, index + distance)) >= 3;
+    }
+
+    private static int Gray(byte[] pixels, int index) =>
+        (pixels[index + 2] * 77 + pixels[index + 1] * 150 + pixels[index] * 29) >> 8;
 }

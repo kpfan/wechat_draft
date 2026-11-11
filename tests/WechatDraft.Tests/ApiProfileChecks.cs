@@ -5,8 +5,9 @@ internal static class ApiProfileChecks
 {
     public static IEnumerable<(string Name, Func<Task> Run)> Cases(string root, ISecretProtector protector)
     {
-        AppSettings Original() => ApiProfileSettings.Normalize(new()
+        AppSettings Original(string profileName = "默认 API") => ApiProfileSettings.Normalize(new()
         {
+            ApiProfileName = profileName,
             BaseUrl = "https://first.example/v1", Model = "first-vision", ProtectedApiKey = "encrypted-first",
             AuthorizedOrigin = "https://first.example", VisionAuthorizedOrigin = "https://first.example",
             AccountScope = "existing-account", ExtraInstruction = "保留补充要求", DemoMode = false,
@@ -22,6 +23,7 @@ internal static class ApiProfileChecks
         {
             var settings = Original();
             Equal(1, settings.ApiProfiles.Count);
+            Equal(settings.ActiveApiProfileId, settings.DefaultApiProfileId);
             var selected = ApiProfileSettings.Select(settings, settings.ActiveApiProfileId);
             Equal("encrypted-first", selected.ProtectedApiKey);
             Equal("https://first.example", selected.VisionAuthorizedOrigin);
@@ -41,6 +43,27 @@ internal static class ApiProfileChecks
             Equal(false, restored.AllowLoopbackHttp);
             Equal(first.AccountScope, restored.AccountScope); Equal(first.ExtraInstruction, restored.ExtraInstruction);
             Equal(first.DemoMode, restored.DemoMode); Equal(first.WindowLayout, restored.WindowLayout);
+            return Task.CompletedTask;
+        });
+        yield return ("First-use screenshot consent works for a migrated default and stays with the confirmed API", () =>
+        {
+            const string origin = "https://first.example";
+            var migrated = ApiProfileSettings.Normalize(Original() with { AuthorizedOrigin = "", VisionAuthorizedOrigin = "" });
+            var defaultId = migrated.DefaultApiProfileId;
+            var custom = ApiProfileSettings.Save(migrated, null, "同地址 API");
+            var customId = custom.ActiveApiProfileId;
+
+            Reject(() => ApiProfileSettings.AuthorizeActiveProfile(custom, defaultId, origin));
+            Reject(() => ApiProfileSettings.AuthorizeActiveProfile(custom, customId, "https://other.example"));
+            var current = ApiProfileSettings.AuthorizeActiveProfile(custom, customId, origin);
+            Equal(origin, current.AuthorizedOrigin);
+            Equal("", current.VisionAuthorizedOrigin);
+            var selectedDefault = ApiProfileSettings.Select(current, defaultId);
+            Equal("", selectedDefault.AuthorizedOrigin);
+            Equal("", selectedDefault.DefaultModelPackageHash);
+            var authorizedDefault = ApiProfileSettings.AuthorizeActiveProfile(selectedDefault, defaultId, origin);
+            Equal(origin, authorizedDefault.AuthorizedOrigin);
+            Equal(origin, ApiProfileSettings.Select(authorizedDefault, customId).AuthorizedOrigin);
             return Task.CompletedTask;
         });
         yield return ("Renaming an API keeps its identity and never creates an extra profile", () =>
@@ -76,8 +99,29 @@ internal static class ApiProfileChecks
             var migrated = ApiProfileSettings.Normalize(legacy);
             Equal(2, migrated.ApiProfiles.Count);
             Equal("备用 API", ApiProfileSettings.Select(migrated, migrated.ActiveApiProfileId).ApiProfileName);
+            Equal(migrated.ApiProfiles[0].Id, migrated.DefaultApiProfileId);
             var json = JsonSerializer.Serialize(migrated.ApiProfiles, JsonDefaults.Options);
             if (json.Contains("apiProfiles") || json.Contains("accountScope")) throw new Exception("Profiles contain unrelated application settings.");
+            return Task.CompletedTask;
+        });
+        yield return ("The default model remains selectable and read-only while a custom API is active", () =>
+        {
+            var first = Original();
+            var second = AddSecond(first);
+            var defaultId = first.ActiveApiProfileId;
+            var reloaded = ApiProfileSettings.Normalize(second with { DefaultApiProfileId = "" });
+            Equal(defaultId, reloaded.DefaultApiProfileId);
+            Equal(second.ActiveApiProfileId, reloaded.ActiveApiProfileId);
+            Reject(() => ApiProfileSettings.EditForm(reloaded, defaultId));
+            Reject(() => ApiProfileSettings.Save(reloaded, defaultId, "改名"));
+            Reject(() => ApiProfileSettings.Delete(reloaded, defaultId));
+            Reject(() => ApiProfileSettings.Save(reloaded, null, ApiProfileSettings.DefaultModelName));
+            var selected = ApiProfileSettings.Select(reloaded, defaultId);
+            Equal(first.BaseUrl, selected.BaseUrl);
+            Equal(first.Model, selected.Model);
+            Equal(first.ProtectedApiKey, selected.ProtectedApiKey);
+            Equal(first.AuthorizedOrigin, selected.AuthorizedOrigin);
+            Equal(defaultId, ApiProfileSettings.Normalize(selected).DefaultApiProfileId);
             return Task.CompletedTask;
         });
         yield return ("Developer connection changes update the active profile without reviving an old endpoint", () =>
@@ -99,6 +143,7 @@ internal static class ApiProfileChecks
             new LocalRepository(folder, protector).SaveSettings(second);
             var loaded = new LocalRepository(folder, protector).LoadSettings();
             Equal(2, loaded.ApiProfiles.Count); Equal(second.ActiveApiProfileId, loaded.ActiveApiProfileId);
+            Equal(first.ActiveApiProfileId, loaded.DefaultApiProfileId);
             Equal("test-second-credential", protector.Unprotect(loaded.ProtectedApiKey));
             var selected = ApiProfileSettings.Select(loaded, first.ActiveApiProfileId);
             Equal("test-first-credential", protector.Unprotect(selected.ProtectedApiKey));
@@ -122,7 +167,7 @@ internal static class ApiProfileChecks
         });
         yield return ("Editing a saved API from the management page never switches the active endpoint", () =>
         {
-            var first = Original(); var second = AddSecond(first);
+            var first = Original("首个自定义 API"); var second = AddSecond(first);
             var inactiveId = first.ApiProfiles[0].Id;
             var form = ApiProfileSettings.EditForm(second, inactiveId);
             Equal(second.ActiveApiProfileId, form.ActiveApiProfileId);
@@ -140,7 +185,7 @@ internal static class ApiProfileChecks
         });
         yield return ("Deleting an API refuses the active or last profile and leaves the runtime untouched", () =>
         {
-            var first = Original(); var second = AddSecond(first);
+            var first = Original("首个自定义 API"); var second = AddSecond(first);
             var inactiveId = first.ApiProfiles[0].Id;
             Reject(() => ApiProfileSettings.Delete(second, second.ActiveApiProfileId));
             Reject(() => ApiProfileSettings.Delete(second, "missing-profile"));

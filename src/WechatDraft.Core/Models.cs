@@ -12,31 +12,46 @@ public static class JsonDefaults
     };
 }
 
-public sealed record AppSettings
+public sealed record AppSettings : IJsonOnDeserializing
 {
     public List<ModelApiProfile> ApiProfiles { get; set; } = [];
     public string ApiProfileName { get; set; } = "默认 API";
     public string ActiveApiProfileId { get; set; } = "";
+    public string DefaultApiProfileId { get; set; } = "";
+    public string DefaultModelPackageHash { get; set; } = "";
     public string BaseUrl { get; set; } = "https://api.example.com/v1";
     public string ApiPath { get; set; } = "chat/completions";
     public string Model { get; set; } = "";
     public string ProtectedApiKey { get; set; } = "";
     public string AuthorizedOrigin { get; set; } = "";
     public string VisionAuthorizedOrigin { get; set; } = "";
-    public string AutomationMode { get; set; } = "auto";
+    public string AutomationMode { get; set; } = "vision";
     public string Scene { get; set; } = "春节";
+    public string? ZodiacYear { get; set; }
     public string ExtraInstruction { get; set; } = "";
     public bool DemoMode { get; set; } = true;
     public bool DebugMode { get; set; }
     public bool AllowLoopbackHttp { get; set; }
-    public bool EnableLiveAppend { get; set; }
+    public bool EnableLiveAppend { get; set; } = true;
     public string AccountScope { get; set; } = "default";
     public string ExamplesPath { get; set; } = "";
     public int RetentionDays { get; set; } = 90;
     public int RequestTimeoutSeconds { get; set; } = 30;
     public int TaskTimeoutSeconds { get; set; } = 90;
-    public uint HotkeyVirtualKey { get; set; } = 0x42;
+    public uint HotkeyVirtualKey { get; set; } = 'A';
+    public HotkeyModifiers HotkeyModifiers { get; set; } = HotkeyModifiers.Control | HotkeyModifiers.Shift;
+    [JsonIgnore]
+    public HotkeyShortcut GenerationHotkey => new(HotkeyModifiers, HotkeyVirtualKey);
     public WindowLayoutSettings? WindowLayout { get; set; }
+
+    void IJsonOnDeserializing.OnDeserializing()
+    {
+        // Older saved settings can omit these fields. Explicit values are applied after this callback.
+        AutomationMode = "auto";
+        EnableLiveAppend = false;
+        HotkeyVirtualKey = 'B';
+        HotkeyModifiers = HotkeyModifiers.Control | HotkeyModifiers.Alt;
+    }
 }
 
 public sealed record WindowLayoutSettings
@@ -152,7 +167,10 @@ public sealed record ModelResponse
 
 public sealed record Capture(string Id, byte[] PngBytes, bool RequiresConversationCheck = false, string? LocalTitle = null);
 public sealed record ConversationSnapshot(string SessionToken, string DisplayName, string OriginalText,
-    string WindowIdentity, bool IsDemo, object? NativeState = null, bool OriginalTextRead = true, bool DisplayNameRead = true, string TitleSource = "uia");
+    string WindowIdentity, bool IsDemo, object? NativeState = null, bool OriginalTextRead = true, bool DisplayNameRead = true, string TitleSource = "uia")
+{
+    public bool DirectAppend { get; init; }
+}
 public sealed record FillResult(string Status, string Message, bool? OriginalPreserved = null);
 public sealed record TaskProgress(string Stage, string Detail, int Percent);
 
@@ -185,7 +203,4 @@ public interface IGreetingModel
 {
     Task<ModelResponse> GenerateAsync(AppSettings settings, string apiKey, IReadOnlyList<Capture> captures,
         Contact? contact, IReadOnlyList<BlessingExample> examples, bool finalRound, CancellationToken cancellationToken);
-    Task<ModelResponse> GenerateAsync(AppSettings settings, string apiKey, IReadOnlyList<Capture> captures,
-        Contact? contact, IReadOnlyList<BlessingExample> examples, bool finalRound, GreetingGenerationContext context,
-        CancellationToken cancellationToken) => GenerateAsync(settings, apiKey, captures, contact, examples, finalRound, cancellationToken);
 }

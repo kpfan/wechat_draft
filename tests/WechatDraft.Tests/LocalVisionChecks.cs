@@ -149,6 +149,105 @@ internal static class LocalVisionChecks
                 if (result.Status != "待手动处理") throw new Exception("A visual result authorized a write.");
             }
         });
+        yield return ("Local layout finds a tall editor boundary above two fifths of the window", () =>
+        {
+            const int separator = 310;
+            using var image = Fixture(192, false, separator);
+            var (layout, _) = WechatLocalLayout.Locate(image, 192, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - separator) > 1 ||
+                layout.Messages!.Bottom >= layout.Input.Y || !layout.Input.Contains(layout.Editor!))
+                throw new Exception("The input boundary or its derived regions were incorrect.");
+            return Task.CompletedTask;
+        });
+        yield return ("An image against the input divider does not prevent layout and write-time geometry checks", () =>
+        {
+            const int separator = 450;
+            using var initial = Fixture(192, false, separator);
+            using var withImage = (Bitmap)initial.Clone();
+            using (var graphics = Graphics.FromImage(withImage))
+                graphics.FillRectangle(Brushes.White, 435, 380, 155, separator - 380);
+
+            var (layout, anchors) = WechatLocalLayout.Locate(initial, 192, default);
+            var (recovered, _) = WechatLocalLayout.Locate(withImage, 192, default);
+            if (recovered.Input!.Y != layout.Input!.Y ||
+                !WechatLocalLayout.CanReuseGeometry(initial, withImage, 192, layout, anchors, default))
+                throw new Exception("A message image moved or hid the divider during layout checks.");
+            return Task.CompletedTask;
+        });
+        yield return ("A short message edge cannot stand in for the input divider", () =>
+        {
+            using var image = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(image))
+                graphics.DrawLine(Pens.Gray, 430, 450, 980, 450);
+            MustReject(() => WechatLocalLayout.Locate(image, 192, default));
+            return Task.CompletedTask;
+        });
+        yield return ("Both editor corners recover the divider when a wide message hides the upper reference", () =>
+        {
+            const int y = 450, left = 332, right = 1072;
+            using var lineOnly = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(lineOnly))
+            {
+                graphics.FillRectangle(Brushes.White, 410, 380, 550, y - 380);
+                graphics.DrawLine(Pens.Gray, left + 16, y, right - 16, y);
+            }
+            MustReject(() => WechatLocalLayout.Locate(lineOnly, 192, default));
+
+            using var framed = (Bitmap)lineOnly.Clone();
+            using (var graphics = Graphics.FromImage(framed))
+            {
+                foreach (var (edge, inward) in new[] { (left, 1), (right, -1) })
+                {
+                    graphics.DrawLines(Pens.Gray, new Point[] { new(edge + inward * 16, y),
+                        new(edge + inward * 3, y + 6), new(edge, y + 12), new(edge, y + 70) });
+                }
+            }
+            var (layout, _) = WechatLocalLayout.Locate(framed, 192, default);
+            if (Math.Abs(layout.Input!.Y * framed.Height / 1000 - y) > 1)
+                throw new Exception("The recovered divider does not align with the top of the editor.");
+            return Task.CompletedTask;
+        });
+        yield return ("Multiple separated partial divider candidates are rejected as ambiguous", () =>
+        {
+            using var image = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(image))
+            {
+                foreach (var y in new[] { 430, 510 })
+                {
+                    graphics.FillRectangle(Brushes.White, 435, y - 30, 155, 30);
+                    graphics.DrawLine(Pens.Gray, 300, y, image.Width - 5, y);
+                }
+            }
+            MustReject(() => WechatLocalLayout.Locate(image, 192, default));
+            return Task.CompletedTask;
+        });
+        yield return ("Visual scrolling rematches changed toolbar pixels without accepting a moved input boundary", () =>
+        {
+            using var initial = Fixture(192, false);
+            var (layout, anchors) = WechatLocalLayout.Locate(initial, 192, default);
+            var frame = new VisionWindowFrame(new(0, 0, initial.Width, initial.Height), 192);
+            bool CanReuse(Bitmap current) => WechatLocalLayout.CanReuseGeometry(initial, current, 192, layout, anchors, default);
+            using var newMessage = (Bitmap)initial.Clone();
+            var messages = frame.ToClientRectangle(layout.Messages!);
+            newMessage.SetPixel(messages.X + messages.Width / 2, messages.Y + 10, Color.Magenta);
+            if (!CanReuse(newMessage)) throw new Exception("A message pixel changed the confirmed toolbar geometry.");
+            foreach (var box in new[] { anchors.TopToolbar, anchors.BottomToolbar })
+            {
+                using var changed = (Bitmap)initial.Clone();
+                var region = frame.ToClientRectangle(box);
+                changed.SetPixel(region.X + region.Width / 2, region.Y + region.Height / 2, Color.Magenta);
+                if (CanReuse(changed)) throw new Exception("A changed toolbar reused the original geometry.");
+                if (!WechatLocalLayout.ConfirmMessageGeometry(initial, changed, frame, layout, anchors, default))
+                    throw new Exception("The message crop was rejected after local rematching confirmed the same geometry.");
+            }
+            using var movedSeparator = Fixture(192, false, 420);
+            using var noSeparator = TemplateLocatorChecks.Fixture(192, false);
+            if (CanReuse(movedSeparator) || CanReuse(noSeparator))
+                throw new Exception("The old input bounds were used without confirming the current divider.");
+            if (WechatLocalLayout.ConfirmMessageGeometry(initial, movedSeparator, frame, layout, anchors, default))
+                throw new Exception("Local rematching accepted an old crop after the input divider moved.");
+            return Task.CompletedTask;
+        });
         yield return ("Missing or ambiguous local anchors stop without a remote layout request", async () =>
         {
             using var blank = new Bitmap(1100, 800);
@@ -171,7 +270,7 @@ internal static class LocalVisionChecks
             try { await adapter.LocateFrozenAsync(image, 192, cancellation.Token); throw new Exception("A cancelled search continued."); }
             catch (OperationCanceledException) { }
         });
-        yield return ("Local crops exclude the contact list and entire input panel", () =>
+        yield return ("Local generation uses the original message crop without title, input or padding", () =>
         {
             using var image = Fixture(192, false);
             var result = WechatLocalLayout.Locate(image, 192, default);
@@ -181,9 +280,13 @@ internal static class LocalVisionChecks
             using var graphics = Graphics.FromImage(image);
             graphics.FillRectangle(Brushes.Magenta, 0, 0, messages.Left - 2, image.Height);
             graphics.FillRectangle(Brushes.Magenta, input);
+            graphics.FillRectangle(Brushes.Magenta, frame.ToClientRectangle(result.Layout.Header!));
+            graphics.FillRectangle(Brushes.Lime, messages.Left, messages.Top, 6, 6);
             graphics.Flush();
             var capture = VisionContextSnapshot.CreateCapture(image, frame, result.Layout, 0);
             using var stream = new MemoryStream(capture.PngBytes); using var crop = new Bitmap(stream);
+            if (crop.Size != messages.Size || crop.GetPixel(0, 0).ToArgb() != Color.Lime.ToArgb())
+                throw new Exception("The message crop was scaled, shifted or padded.");
             for (var y = 0; y < crop.Height; y += 3)
                 for (var x = 0; x < crop.Width; x += 3)
                     if (crop.GetPixel(x, y).ToArgb() == Color.Magenta.ToArgb()) throw new Exception("Private neighboring pixels entered the model crop.");
@@ -260,11 +363,11 @@ internal static class LocalVisionChecks
         public Task<string> ReadAsync(Bitmap titleImage, CancellationToken cancellationToken) => Task.FromResult("title-" + ++_calls);
     }
 
-    private static Bitmap Fixture(uint dpi, bool toolbarAtTop)
+    private static Bitmap Fixture(uint dpi, bool toolbarAtTop, int? separatorY = null)
     {
         var image = TemplateLocatorChecks.Fixture(dpi, false);
         using var graphics = Graphics.FromImage(image); using var pen = new Pen(Color.Gray);
-        var separator = toolbarAtTop ? 610 - (int)(20 * dpi / 96d) : 450;
+        var separator = separatorY ?? (toolbarAtTop ? 610 - (int)(20 * dpi / 96d) : 450);
         graphics.DrawLine(pen, 300, separator, image.Width - 5, separator);
         return image;
     }

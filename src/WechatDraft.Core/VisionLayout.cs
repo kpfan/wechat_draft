@@ -299,7 +299,7 @@ public static class VisionDraftAppender
         ct.ThrowIfCancellationRequested();
         if (await readDraft(ct) != original) return new("待手动处理", "原有草稿发生变化，未输入。");
         ct.ThrowIfCancellationRequested();
-        await pasteSuffix(DraftRules.AppendSuffix(original, greeting), ct);
+        await pasteSuffix(greeting, ct);
         ct.ThrowIfCancellationRequested();
         var actual = await readDraft(ct);
         return DraftRules.NormalizeNewlines(actual) == DraftRules.NormalizeNewlines(DraftRules.Append(original, greeting))

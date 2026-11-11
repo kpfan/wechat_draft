@@ -277,16 +277,21 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
         // 会话类型由标题栏类名、群成员数和入口等结构证据判定；只有真人私聊才继续。
         // 群聊、公众号、服务通知及无法确认的类型一律停止，不回退到无法核实会话类型的视觉路径。
         WechatConversationRules.RequirePrivateChat(CollectConversationEvidence(root, headers[0], name,
-            singleChat.Count > 0, groupAffordance.Count > 0));
+            singleChat.Count > 0, groupAffordance.Count > 0, out var titleBarBounds));
         var value = (ValuePattern)editor.GetCurrentPattern(ValuePattern.Pattern);
         if (value.Current.IsReadOnly || value.Current.Value.Contains('\uFFFC')) throw new InvalidOperationException("输入框含不支持的对象或不可编辑。");
         Native.GetWindowThreadProcessId(hwnd, out var processId);
         using var process = System.Diagnostics.Process.GetProcessById((int)processId);
         var identity = $"{processId}:{process.StartTime.ToUniversalTime().Ticks}:{hwnd}";
         // captureArea 供 CopyFromScreen 截图，保持物理像素；边距与最小尺寸按缩放换算。
-        var left = Math.Max(bounds.Left, inputRect.Left - 10 * scale);
-        var captureArea = new System.Windows.Rect(left, bounds.Top + 25 * scale, bounds.Right - left - 8 * scale, inputRect.Top - bounds.Top - 35 * scale);
-        if (captureArea.Width / scale < 200 || captureArea.Height / scale < 100) throw new InvalidOperationException("可用消息区域过小，请放大微信窗口。");
+        if (titleBarBounds.IsEmpty || titleBarBounds.Height <= 0)
+            throw new UiAutomationUnavailableException("UIA 未提供有效的标题栏边界，无法安全裁剪消息区。");
+        var left = Math.Ceiling(Math.Max(bounds.Left, inputRect.Left - 10 * scale));
+        var top = Math.Ceiling(Math.Max(titleBarBounds.Bottom, headers[0].Current.BoundingRectangle.Bottom));
+        var width = Math.Floor(bounds.Right - 8 * scale) - left;
+        var height = Math.Floor(inputRect.Top - 10 * scale) - top;
+        if (width / scale < 200 || height / scale < 100) throw new InvalidOperationException("可用消息区域过小，请放大微信窗口。");
+        var captureArea = new System.Windows.Rect(left, top, width, height);
         var scrolls = root.FindAll(TreeScope.Descendants, new PropertyCondition(AutomationElement.IsScrollPatternAvailableProperty, true))
             .Cast<AutomationElement>().Where(e => !e.Current.IsOffscreen && e.Current.BoundingRectangle.Left >= captureArea.Left - 15 * scale &&
                 e.Current.BoundingRectangle.Height > 100 * scale && e.Current.BoundingRectangle.Bottom <= inputRect.Top + 10 * scale &&
@@ -299,7 +304,7 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
     }
 
     private static WechatConversationEvidence CollectConversationEvidence(AutomationElement root, AutomationElement header,
-        string chatName, bool hasSingleChatAffordance, bool hasGroupAffordance)
+        string chatName, bool hasSingleChatAffordance, bool hasGroupAffordance, out System.Windows.Rect titleBarBounds)
     {
         // 标题栏容器：从会话名叶节点沿 RawView 向上找 mmui 标题栏；找不到则不猜测父容器，按无法确认处理。
         AutomationElement? titleBar = null;
@@ -312,6 +317,7 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
             if (parent is null) break;
             current = parent;
         }
+        titleBarBounds = titleBar?.Current.BoundingRectangle ?? System.Windows.Rect.Empty;
         var classNames = new List<string>();
         int? memberCount = null;
         if (titleBar is not null)
@@ -506,25 +512,10 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
             var rect = state.MessageArea;
             using var bitmap = new Bitmap((int)rect.Width, (int)rect.Height);
             using (var graphics = Graphics.FromImage(bitmap)) graphics.CopyFromScreen((int)rect.Left, (int)rect.Top, 0, 0, bitmap.Size);
-            // Give small Chinese title glyphs their own enlarged view, using only captured pixels.
-            // The exact leaf title excludes adjacent enterprise badges and the input draft.
-            var header = System.Windows.Rect.Intersect(state.Header.Current.BoundingRectangle, rect);
-            if (header.IsEmpty || header.Width < 1 || header.Height < 1) throw new InvalidOperationException("聊天标题不在截图范围内。");
-            var source = new Rectangle((int)(header.Left - rect.Left), (int)(header.Top - rect.Top), (int)header.Width, (int)header.Height);
-            var scale = Math.Min(4d, 1800d / source.Width);
-            var titleWidth = (int)(source.Width * scale); var titleHeight = (int)(source.Height * scale);
-            using var composite = new Bitmap(Math.Max(bitmap.Width, titleWidth + 24), bitmap.Height + titleHeight + 24);
-            using (var graphics = Graphics.FromImage(composite))
-            {
-                graphics.Clear(Color.White);
-                graphics.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
-                graphics.DrawImage(bitmap, new Rectangle(12, 8, titleWidth, titleHeight), source, GraphicsUnit.Pixel);
-                graphics.DrawImageUnscaled(bitmap, 0, titleHeight + 24);
-            }
             if (Native.GetForegroundWindow() != target || WasInterrupted())
                 throw new InvalidOperationException("采集期间窗口状态已变化，已丢弃画面。请重新触发。");
-            using var stream = new MemoryStream(); composite.Save(stream, ImageFormat.Png);
-            return new Capture($"capture_{index}", stream.ToArray());
+            using var stream = new MemoryStream(); bitmap.Save(stream, ImageFormat.Png);
+            return new Capture($"capture_{index}", stream.ToArray(), RequiresConversationCheck: true, LocalTitle: state.HeaderName);
         }, cancellationToken);
     }
 
@@ -541,7 +532,8 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
         {
             scroll.Scroll(ScrollAmount.NoAmount, ScrollAmount.LargeDecrement); _scrolled = true;
             await Task.Delay(220, cancellationToken);
-            return Math.Abs(scroll.Current.VerticalScrollPercent - before) > 0.01;
+            return !UserScrolled && Native.GetForegroundWindow() == target &&
+                Math.Abs(scroll.Current.VerticalScrollPercent - before) > 0.01;
         }
         finally { _programmaticScroll = false; }
     }
@@ -579,16 +571,22 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
             ((ValuePattern)state.Editor.GetCurrentPattern(ValuePattern.Pattern)).SetValue(completeText);
             return await VerifyAppendAsync(snapshot, state, completeText);
         }
-        var suffix = DraftRules.AppendSuffix(snapshot.OriginalText, greeting);
-        using var clipboard = new SafeClipboard(target, suffix);
+        SafeClipboard? clipboard = null;
+        Native.INPUT[]? directInput = null;
+        try { clipboard = new SafeClipboard(target, greeting); }
+        catch (ClipboardBackupUnavailableException) { directInput = Native.PrepareUnicodeInput(greeting); }
+        using var clipboardProtection = clipboard;
         // Ctrl+End collapses any selection at the end; no Enter key is ever injected.
         Native.VisionChord(0x23);
         cancellationToken.ThrowIfCancellationRequested();
-        if (!await IsUnchangedAsync(snapshot, cancellationToken) || !SameConversation(state) || HasUnfinishedInput() ||
+        if (!await IsUnchangedAsync(snapshot, cancellationToken) || !SameConversation(state) || HasUnfinishedInput() || ModifiersHeld() ||
+            Native.GetForegroundWindow() != target ||
             !AutomationElement.FocusedElement.Equals(state.Editor) || commitActivityVersion != _inputMonitor?.ActivityVersion)
-            return new("待手动处理", "粘贴前会话、草稿或输入焦点发生变化，未输入。");
+            return new("待手动处理", "填写前会话、草稿或输入焦点发生变化，未输入。");
+        cancellationToken.ThrowIfCancellationRequested();
         _pasteIssued = true;
-        Native.VisionChord(0x56);
+        if (directInput is not null) Native.Keys(directInput);
+        else Native.VisionChord(0x56);
         return await VerifyAppendAsync(snapshot, state, DraftRules.Append(snapshot.OriginalText, greeting));
     }
 
@@ -660,11 +658,12 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
         WasInterrupted();
         return false;
     }
+    private static bool ModifiersHeld() => new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C }.Any(k => (Native.GetAsyncKeyState(k) & 0x8000) != 0);
     private static async Task WaitModifiersAsync(CancellationToken ct)
     {
         for (var i = 0; i < 30; i++)
         {
-            if (new[] { 0x10, 0x11, 0x12, 0x5B, 0x5C }.All(k => (Native.GetAsyncKeyState(k) & 0x8000) == 0)) return;
+            if (!ModifiersHeld()) return;
             await Task.Delay(50, ct);
         }
         throw new InvalidOperationException("请松开 Ctrl、Alt、Shift 等修饰键后重试。");

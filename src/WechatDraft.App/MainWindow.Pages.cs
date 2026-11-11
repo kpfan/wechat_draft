@@ -1,8 +1,11 @@
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Input;
 using WechatDraft.Core;
 using WechatDraft.Windows;
 using Windows.Storage.Pickers;
+using Windows.System;
+using Windows.UI.Core;
 
 namespace WechatDraft.App;
 
@@ -57,7 +60,7 @@ public sealed partial class MainWindow
         if (IsTaskBusy) return;
         var name = Ui.Input("显示名", contact.DisplayName); var remark = Ui.Input("备注名（可空）", contact.RemarkName ?? "");
         var relationship = Ui.Combo("与我的关系", DraftRules.Relationships.Select(RelationshipLabel), RelationshipLabel(contact.Relationship));
-        var address = Ui.Input("称呼（用于祝福开头）", contact.AddressTerm ?? "", "例如：陈老师、小王；不确定时留空");
+        var address = Ui.Input("称呼（用于祝福开头）", contact.AddressTerm ?? "", "例如：小明。不确定时留空。");
         var identity = Ui.Input("补充身份（可空）", contact.IdentityLabel ?? "", "例如：前同事");
         var confirmed = new CheckBox { Content = "我已核对上述关系和称呼", IsChecked = contact.Confirmed };
         var form = Ui.Stack(14, name, remark, relationship, address, identity, confirmed,
@@ -97,7 +100,19 @@ public sealed partial class MainWindow
             IsEnabled = DebugSession.IsSupported };
         var account = Ui.Input("本地微信账号工作区", _settings.AccountScope, "更换微信账号时请更改工作区名称");
         var retention = Ui.Combo("历史保留期限", ["30 天", "90 天", "手动清理"], _settings.RetentionDays == 0 ? "手动清理" : _settings.RetentionDays + " 天");
-        var hotkey = Ui.Input("快捷键字母（Ctrl + Alt + 字母）", ((char)_settings.HotkeyVirtualKey).ToString()); hotkey.MaxLength = 1;
+        var shortcut = _settings.GenerationHotkey;
+        var shortcutLabel = Ui.Text(shortcut.ToString(), bold: true);
+        shortcutLabel.VerticalAlignment = VerticalAlignment.Center;
+        var hotkeyHelp = Ui.Text("点击录制，在弹窗里按下你想用的组合键。", 12, "7F8D82");
+        var recordHotkey = Ui.Button("录制快捷键", async () =>
+        {
+            if (await RecordHotkeyAsync() is not { } value) return;
+            dirty |= shortcut != value;
+            shortcut = value;
+            shortcutLabel.Text = value.ToString();
+            hotkeyHelp.Text = "录制完成。点击「保存设置」使快捷键生效。";
+        });
+        var hotkey = Ui.Stack(6, Ui.Text("全局快捷键"), Ui.Row(12, recordHotkey, shortcutLabel), hotkeyHelp);
         var status = new InfoBar { IsOpen = false };
         void Feedback(string text, bool ok) { status.Message = text; status.Severity = ok ? InfoBarSeverity.Success : InfoBarSeverity.Error; status.IsOpen = true; }
         if (message is not null) Feedback(message, true);
@@ -112,8 +127,10 @@ public sealed partial class MainWindow
                 RetentionDays = (string)retention.SelectedItem == "手动清理" ? 0 : (string)retention.SelectedItem == "30 天" ? 30 : 90
             };
             if (string.IsNullOrWhiteSpace(candidate.AccountScope)) throw new InvalidDataException("账号工作区不能为空。");
-            var letter = hotkey.Text.ToUpperInvariant(); if (letter.Length != 1 || letter[0] is < 'A' or > 'Z') throw new InvalidDataException("快捷键字母应为 A 至 Z。");
-            candidate.HotkeyVirtualKey = letter[0];
+            if (!shortcut.IsValid)
+                throw new InvalidDataException("请录制一个有效的快捷键。");
+            candidate.HotkeyVirtualKey = shortcut.VirtualKey;
+            candidate.HotkeyModifiers = shortcut.Modifiers;
             return candidate;
         }
         var save = Ui.Button("保存设置", () =>
@@ -121,16 +138,20 @@ public sealed partial class MainWindow
             try
             {
                 var candidate = ReadForm();
-                if (!_paused && _hotkey?.Register(candidate.HotkeyVirtualKey) == false) { _hotkey.Register(_settings.HotkeyVirtualKey); throw new InvalidDataException("快捷键被占用，请更换字母。"); }
+                if (_paused || _hotkey is null)
+                    _repository.SaveSettings(candidate);
+                else if (!_hotkey.Register(candidate.GenerationHotkey, () => _repository.SaveSettings(candidate)))
+                    throw new InvalidDataException("快捷键已被占用或由 Windows 保留，请换一个组合。");
+                _settings = candidate;
+                UpdateHotkeyFooter();
                 StopSentRecording("设置已更新，请为目标聊天重新开启发送归档。");
-                _repository.SaveSettings(candidate); _settings = candidate; _repository.Cleanup(candidate.RetentionDays); SeedDemoContacts();
-                _footer.Text = "Ctrl + Alt + " + (char)candidate.HotkeyVirtualKey;
+                _repository.Cleanup(candidate.RetentionDays); SeedDemoContacts();
                 ShowSettings("设置已保存。模型 API 的连接与授权在「API 管理」页面维护。");
             }
             catch (Exception e) { Feedback(e.Message, false); }
         }, true);
         var options = Ui.Card(Ui.Stack(17, Ui.Text("工作区与预填", 20, bold: true), automation, account, hotkey, retention, liveAppend,
-            Ui.Text("预填默认关闭，与首页选项同步。生成期间可以浏览本软件，填写前最多等待 30 秒返回原微信聊天，不抢占窗口。转到其他程序、切换聊天、修改草稿或输入焦点不安全时不填写。复查当前聊天面板、标题、输入控件和原草稿；支持的界面不要求左侧联系人一直可见。不会自动发送。", 12, "8B7953"),
+            Ui.Text("预填与首页选项同步。生成期间可以浏览本软件，填写前最多等待 30 秒返回原微信聊天，不抢占窗口。转到其他程序、切换聊天、修改草稿或输入焦点不安全时不填写。复查当前聊天面板、标题、输入控件和原草稿；支持的界面不要求左侧联系人一直可见。不会自动发送。", 12, "8B7953"),
             Ui.Text("视觉模式用本地 OCR 读取并复查标题。开启预填后，会核对完整原文、追加并读回确认；复制或标题不明确时只保留生成结果。生成时可查看助手，实际读取和填写须回到原微信聊天。不会自动发送。", 12, "8B7953"),
             debugMode,
             Ui.Text(DebugSession.IsSupported ? "调试模式会在程序旁的 debug 文件夹按任务保存截图、模型原始返回、定位结果和日志，可能含联系人、聊天及草稿。关闭后不再新增，已有文件保留。密钥始终不写入日志。" : "当前为正式版本，调试记录已在构建时禁用，不保存中间截图和模型日志。", 12, "7F8D82"),
@@ -142,7 +163,7 @@ public sealed partial class MainWindow
             }),
             Ui.Text("常规业务数据位于程序旁的 data 文件夹；关闭调试模式时截图仅在内存处理。", 12, "7F8D82"),
             save, status));
-        foreach (var input in new[] { account, hotkey }) input.TextChanged += (_, _) => dirty = true;
+        account.TextChanged += (_, _) => dirty = true;
         foreach (var checkbox in new[] { liveAppend, debugMode }) checkbox.Click += (_, _) => dirty = true;
         automation.SelectionChanged += (_, _) => dirty = true; retention.SelectionChanged += (_, _) => dirty = true;
         Present(Ui.Stack(20, Ui.Text("设置", 28, bold: true),
@@ -150,6 +171,61 @@ public sealed partial class MainWindow
             Ui.Button("前往 API 管理", async () =>
             { if (dirty && !await ConfirmAsync("放弃未保存的修改？", "设置页的修改尚未保存，继续会丢弃这些修改。")) return; ShowApiProfiles(); }),
             options));
+    }
+    private async Task<HotkeyShortcut?> RecordHotkeyAsync()
+    {
+        var hint = Ui.Text("同时按下你想使用的组合，例如 Ctrl + Shift + B、Alt + 7 或 F9。", 13, "7F8D82");
+        var dialog = new ContentDialog
+        {
+            Title = "请按下快捷键",
+            Content = Ui.Stack(12, Ui.Badge("等待按键"), hint),
+            CloseButtonText = "取消",
+            RequestedTheme = _root.RequestedTheme,
+            XamlRoot = _root.XamlRoot
+        };
+        HotkeyShortcut? result = null;
+        var closing = false;
+        void FinishRecording(HotkeyShortcut? recorded)
+        {
+            if (closing) return;
+            closing = true;
+            result = recorded;
+            dialog.Hide();
+        }
+        dialog.Closing += (_, _) => closing = true;
+        dialog.PreviewKeyDown += (_, args) =>
+        {
+            if (closing || args.Key is VirtualKey.Tab or VirtualKey.Escape or VirtualKey.Enter or VirtualKey.Space) return;
+            args.Handled = true;
+            if (args.KeyStatus.WasKeyDown || args.Key is VirtualKey.Control or VirtualKey.Menu or VirtualKey.Shift or
+                VirtualKey.LeftControl or VirtualKey.RightControl or VirtualKey.LeftMenu or VirtualKey.RightMenu or
+                VirtualKey.LeftShift or VirtualKey.RightShift or VirtualKey.LeftWindows or VirtualKey.RightWindows) return;
+
+            var recorded = new HotkeyShortcut(ReadHotkeyModifiers(), (uint)args.OriginalKey);
+            if (recorded.IsValid) FinishRecording(recorded);
+            else hint.Text = "请按修饰键加字母或数字，或按 F1–F11。按 Esc 取消。";
+        };
+        _finishHotkeyRecording = FinishRecording;
+        try
+        {
+            await dialog.ShowAsync();
+            return result;
+        }
+        finally
+        {
+            _finishHotkeyRecording = null;
+        }
+    }
+
+    private static HotkeyModifiers ReadHotkeyModifiers()
+    {
+        static bool Down(VirtualKey key) => (InputKeyboardSource.GetKeyStateForCurrentThread(key) & CoreVirtualKeyStates.Down) != 0;
+        var modifiers = HotkeyModifiers.None;
+        if (Down(VirtualKey.Control)) modifiers |= HotkeyModifiers.Control;
+        if (Down(VirtualKey.Menu)) modifiers |= HotkeyModifiers.Alt;
+        if (Down(VirtualKey.Shift)) modifiers |= HotkeyModifiers.Shift;
+        if (Down(VirtualKey.LeftWindows) || Down(VirtualKey.RightWindows)) modifiers |= HotkeyModifiers.Windows;
+        return modifiers;
     }
     private static string? NullIfEmpty(string value) => string.IsNullOrWhiteSpace(value) ? null : value.Trim();
     internal static string RelationshipLabel(string relationship) => relationship switch

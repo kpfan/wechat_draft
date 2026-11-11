@@ -28,6 +28,27 @@ static class ClipboardChecks
             using (var session = new ClipboardSession(backend)) Invalid(() => session.PutText("probe"));
             Require(backend.Empties == 0 && backend.Data[13][0] == 42, "allocation destroyed original");
         });
+        yield return ("Unsupported clipboard fallback prepares only Unicode text without touching the clipboard", () =>
+        {
+            var backend = new FakeClipboard { CaptureFails = true };
+            backend.Data[49313] = [8, 9];
+            var original = Clone(backend.Data);
+            const string greeting = "生日快乐 🎉";
+            Native.INPUT[]? input = null;
+            try { using var clipboard = new ClipboardSession(backend); }
+            catch (ClipboardBackupUnavailableException) { input = Native.PrepareUnicodeInput(greeting); }
+            Same(original, backend.Data);
+            Require(backend.Sequence == 1 && backend.Empties == 0 && backend.Disposed, "clipboard was touched");
+            Require(input?.Length == greeting.Length * 2, "missing Unicode events");
+            for (var i = 0; i < input!.Length; i++)
+            {
+                var key = input[i].Data.Keyboard;
+                Require(input[i].Type == 1 && key.Key == 0 && key.Scan == greeting[i / 2] &&
+                    key.Flags == (i % 2 == 0 ? 4u : 6u) && key.ExtraInfo == Native.VisionInputTag, "unexpected key or broken Unicode pair");
+            }
+            foreach (var unsafeText in new[] { "a\rb", "a\nb", "a\tb", "a\u2028b" })
+                Invalid(() => Native.PrepareUnicodeInput(unsafeText));
+        });
         yield return ("New external clipboard data blocks writes and survives disposal", () =>
         {
             var backend = new FakeClipboard();
@@ -115,7 +136,7 @@ static class ClipboardChecks
         public void Copy(uint owner, string text) { OwnerProcess = owner; Text = text; Data = new() { [13] = System.Text.Encoding.Unicode.GetBytes(text + '\0') }; Sequence++; }
         public IClipboardSnapshot Capture()
         {
-            if (CaptureFails) throw new InvalidOperationException("unsupported");
+            if (CaptureFails) throw new ClipboardBackupUnavailableException("unsupported");
             return new Snapshot(this, Clone(Data));
         }
         public IClipboardWrite PrepareText(string text)

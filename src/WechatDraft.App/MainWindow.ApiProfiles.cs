@@ -19,6 +19,7 @@ public sealed partial class MainWindow
         _homeVisible = false;
         if (editingId is not null && !_settings.ApiProfiles.Any(p => p.Id == editingId))
         { editingId = null; message = "该 API 配置已不存在，请重新选择。"; success = false; }
+        if (editingId == _settings.DefaultApiProfileId) editingId = null;
         var editedProfile = editingId is null ? null : _settings.ApiProfiles.SingleOrDefault(p => p.Id == editingId);
         var formSettings = adding ? _settings with
         {
@@ -35,19 +36,23 @@ public sealed partial class MainWindow
 
         var rows = Ui.Stack(12);
         var emptyHint = Ui.Text("", 13, "839086");
-        foreach (var profile in _settings.ApiProfiles)
+        foreach (var profile in _settings.ApiProfiles.OrderByDescending(p => p.Id == _settings.DefaultApiProfileId))
         {
             var isActive = profile.Id == _settings.ActiveApiProfileId;
-            var info = Ui.Stack(5,
-                Ui.Text(profile.ApiProfileName + (isActive ? " · 使用中" : ""), 15, bold: true),
-                Ui.Text("链接：" + profile.BaseUrl.TrimEnd('/') + "/" + profile.ApiPath, 12, "7C8B81"),
-                Ui.Text("模型：" + (profile.Model.Length > 0 ? profile.Model : "尚未填写"), 12, "7C8B81"),
-                Ui.Badge(profile.ProtectedApiKey.Length > 0 ? "密钥已加密保存" : "未保存密钥",
+            var isDefault = profile.Id == _settings.DefaultApiProfileId;
+            var displayName = isDefault ? ApiProfileSettings.DefaultModelName : profile.ApiProfileName;
+            var info = Ui.Stack(5, Ui.Text(displayName + (isActive ? " · 使用中" : ""), 15, bold: true));
+            if (!isDefault)
+            {
+                info.Children.Add(Ui.Text("链接：" + profile.BaseUrl.TrimEnd('/') + "/" + profile.ApiPath, 12, "7C8B81"));
+                info.Children.Add(Ui.Text("模型：" + (profile.Model.Length > 0 ? profile.Model : "尚未填写"), 12, "7C8B81"));
+                info.Children.Add(Ui.Badge(profile.ProtectedApiKey.Length > 0 ? "密钥已加密保存" : "未保存密钥",
                     profile.ProtectedApiKey.Length > 0 ? "197861" : "8D794E",
                     profile.ProtectedApiKey.Length > 0 ? "E7F3ED" : "F5F0E4"));
+            }
             var choice = new RadioButton { Content = info, GroupName = "ApiProfiles", IsChecked = isActive };
             Microsoft.UI.Xaml.Automation.AutomationProperties.SetName(choice,
-                profile.ApiProfileName + (isActive ? "，使用中" : "，勾选使用"));
+                displayName + (isActive ? "，使用中" : "，勾选使用"));
             choice.Checked += async (_, _) =>
             {
                 try
@@ -56,10 +61,15 @@ public sealed partial class MainWindow
                     var candidate = ApiProfileSettings.Select(_settings, profile.Id);
                     StopSentRecording("模型 API 已切换，请为目标聊天重新开启发送归档。");
                     _repository.SaveSettings(candidate); _settings = candidate;
-                    RenderApiProfiles(null, false, "当前使用：" + candidate.ApiProfileName + "。密钥已加密保护。");
+                    RenderApiProfiles(null, false, "当前使用：" + displayName + "。");
                 }
                 catch (Exception e) { RenderApiProfiles(editingId, adding, e.Message, false); }
             };
+            if (isDefault)
+            {
+                rows.Children.Add(Ui.Card(Ui.Row(12, choice), "FFFFFF", 16));
+                continue;
+            }
             var edit = Ui.Button("编辑", async () =>
             {
                 if (editingId == profile.Id) return;
@@ -92,7 +102,7 @@ public sealed partial class MainWindow
         }, true);
         var listCard = Ui.Card(Ui.Stack(12,
             Ui.Row(16, Ui.Text("已保存 " + _settings.ApiProfiles.Count + " 组 API", 20, bold: true), add),
-            Ui.Text("勾选哪一组，生成任务就使用哪一组；点「编辑」可以修改链接、模型、密钥和授权。", 13, "7C8B81"),
+            Ui.Text("勾选要使用的模型。自定义 API 可通过「编辑」查看或修改配置。", 13, "7C8B81"),
             emptyHint, rows, pageStatus));
 
         Border? editorCard = null;
@@ -104,8 +114,22 @@ public sealed partial class MainWindow
             var baseUrl = Ui.Input("Base URL", formSettings!.BaseUrl, "https://服务域名/v1");
             var path = Ui.Input("接口相对路径", formSettings.ApiPath, "chat/completions");
             var model = Ui.Input("多模态模型名称", formSettings.Model, "填写服务商提供的视觉模型名称");
-            var key = new PasswordBox { Header = "API Key", PlaceholderText = formSettings.ProtectedApiKey.Length > 0 ? "已加密保存；留空保留原密钥" : "只保存在当前 Windows 用户下", PasswordRevealMode = PasswordRevealMode.Peek };
+            var savedKey = "";
+            try { savedKey = _protector.Unprotect(formSettings.ProtectedApiKey); }
+            catch (Exception e) when (e is FormatException or InvalidOperationException)
+            {
+                EditorFeedback("无法读取已保存的 API Key。可以输入新密钥，或留空保留原密钥。", false);
+            }
+            var key = new PasswordBox
+            {
+                Header = "API Key",
+                PlaceholderText = formSettings.ProtectedApiKey.Length > 0 ? "留空保留原密钥" : "输入 API Key",
+                PasswordRevealMode = PasswordRevealMode.Visible,
+                Password = savedKey
+            };
             var local = new CheckBox { Content = "允许本机回环地址使用 HTTP", IsChecked = formSettings.AllowLoopbackHttp };
+            var localOption = Ui.Stack(4, local,
+                Ui.Text("仅用于这台电脑上的 HTTP 服务，例如 http://127.0.0.1:8000/v1。HTTPS 地址无需启用。", 12, "71817B"));
             var renderedOrigin = "";
             try { renderedOrigin = DraftRules.Origin(formSettings); } catch (InvalidDataException) { }
             var consent = new CheckBox { Content = "同意把必要聊天截图上传至上方服务地址", IsChecked = renderedOrigin.Length > 0 && formSettings.AuthorizedOrigin == renderedOrigin };
@@ -126,7 +150,9 @@ public sealed partial class MainWindow
                 var origin = DraftRules.Origin(candidate);
                 candidate.AuthorizedOrigin = consent.IsChecked == true ? origin : "";
                 candidate.VisionAuthorizedOrigin = ""; // Retired whole-window model positioning consent.
-                if (key.Password.Length > 0) candidate.ProtectedApiKey = _protector.Protect(key.Password);
+                var enteredKey = key.Password;
+                if (enteredKey.Length > 0 && !string.Equals(enteredKey, savedKey, StringComparison.Ordinal))
+                    candidate.ProtectedApiKey = _protector.Protect(enteredKey);
                 return candidate;
             }
             var editingActive = !adding && editingId == _settings.ActiveApiProfileId;
@@ -183,7 +209,7 @@ public sealed partial class MainWindow
             editorCard = Ui.Card(Ui.Stack(16,
                 Ui.Text(adding ? "添加新的 API" : "编辑 API · " + editedProfile!.ApiProfileName, 20, bold: true),
                 Ui.Badge("Chat Completions 图像协议"),
-                profileName, baseUrl, path, model, key, local, consent,
+                profileName, baseUrl, path, model, key, localOption, consent,
                 Ui.Text("UIA 不可用时用本地模板定位，不上传整窗。生成及发送核对仅上传标题和消息裁剪。", 12, "71817B"),
                 Ui.Row(10, save, test, clearKey, cancel), editorStatus,
                 Ui.Text("测试仅上传自动生成的验证码图片，可能产生模型费用。不会上传微信截图。保存不会改变「使用中」的勾选。", 11, "8A978E")));
@@ -191,9 +217,7 @@ public sealed partial class MainWindow
             key.PasswordChanged += (_, _) => editorDirty = true;
             foreach (var checkbox in new[] { local, consent }) checkbox.Click += (_, _) => editorDirty = true;
         }
-        var content = Ui.Stack(20, Ui.Text("API 管理", 28, bold: true),
-            Ui.Text("连接多组多模态模型服务。勾选哪一组，生成任务就使用哪一组；已保存的 API 可以随时修改链接和模型。", 13, "7C8B81"),
-            listCard);
+        var content = Ui.Stack(20, Ui.Text("API 管理", 28, bold: true), listCard);
         if (editorCard is not null) content.Children.Add(editorCard);
         content.Children.Add(Ui.Text("切换或修改 API 不改变工作区、历史、场景与自动追加开关；新增配置不继承其他配置的密钥或授权。", 12, "8B958E"));
         Present(content);

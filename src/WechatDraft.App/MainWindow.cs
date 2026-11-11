@@ -18,10 +18,11 @@ public sealed partial class MainWindow : Window
     private readonly TaskCoordinator _coordinator;
     private readonly ContentControl _page = new() { HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch };
     private HistoryPageView? _historyView;
-    private readonly TextBlock _footer = Ui.Text("Ctrl + Alt + B", 12, "71817B");
+    private readonly TextBlock _footer = Ui.Text("", 12, "71817B");
     private readonly List<Button> _navigation = [];
     private AppSettings _settings;
     private GlobalHotkey? _hotkey;
+    private Action<HotkeyShortcut?>? _finishHotkeyRecording;
     private CancellationTokenSource? _runCancellation;
     private TaskRecord? _latest;
     private readonly Grid _root;
@@ -42,6 +43,7 @@ public sealed partial class MainWindow : Window
     private Image? _visionPreview;
     private Border? _visionPreviewCard;
     private ComboBox? _scene;
+    private ComboBox? _zodiac;
     private TextBox? _extra;
     private ToggleSwitch? _mode;
     private ComboBox? _windows;
@@ -59,6 +61,7 @@ public sealed partial class MainWindow : Window
         _dataDirectory = Environment.GetEnvironmentVariable("WECHAT_DRAFT_DATA") ?? Path.Combine(AppContext.BaseDirectory, "data");
         _repository = new LocalRepository(_dataDirectory, _protector);
         _settings = _repository.LoadSettings();
+        var packageWarning = LoadPackagedDefault();
         _repository.RecoverInterrupted(); _repository.Cleanup(_settings.RetentionDays);
         var bundled = Path.Combine(AppContext.BaseDirectory, "config", "blessing_examples.json");
         _examples.Load(bundled);
@@ -76,25 +79,36 @@ public sealed partial class MainWindow : Window
         Content = _root;
         ConfigureWindowLayout();
         ShowHome();
+        if (packageWarning is not null) Notify(packageWarning, InfoBarSeverity.Warning);
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _hotkey = new GlobalHotkey(hwnd);
-        _hotkey.Pressed += () => DispatcherQueue.TryEnqueue(() => { if (!_paused) _ = StartTaskAsync(); });
-        if (!_hotkey.Register(_settings.HotkeyVirtualKey)) _footer.Text = "快捷键冲突，请到设置修改";
+        _hotkey.Pressed += () =>
+        {
+            var recording = _finishHotkeyRecording;
+            var shortcut = _settings.GenerationHotkey;
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (recording is not null)
+                {
+                    if (_finishHotkeyRecording == recording) recording(shortcut);
+                }
+                else if (_finishHotkeyRecording is null && !_paused)
+                    _ = StartTaskAsync();
+            });
+        };
+        Activated += (_, args) =>
+        {
+            if (args.WindowActivationState == WindowActivationState.Deactivated) _finishHotkeyRecording?.Invoke(null);
+        };
+        _hotkey.Register(_settings.GenerationHotkey);
+        UpdateHotkeyFooter();
         SetupTray();
         ConfigureWindowRefresh();
         Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
     }
 
     private void SeedDemoContacts()
-    {
-        _demoContacts = _repository.Contacts(_settings.AccountScope).Where(x => x.IsDemo && x.Confirmed).ToList();
-        if (_demoContacts.Count > 0) return;
-        foreach (var contact in new[]
-        {
-            new Contact { DisplayName = "陈老师", RemarkName = "陈老师", Relationship = "teacher", AddressTerm = "陈老师", Confirmed = true, IsDemo = true, BindingStatus = "demo", AccountScope = _settings.AccountScope },
-            new Contact { DisplayName = "小林", RemarkName = "小林", Relationship = "friend", AddressTerm = "小林", Confirmed = true, IsDemo = true, BindingStatus = "demo", AccountScope = _settings.AccountScope }
-        }) { _repository.SaveContact(contact); _demoContacts.Add(contact); }
-    }
+        => _demoContacts = DemoContactDefaults.Load(_repository, _settings.AccountScope);
 
     private Border BuildSidebar()
     {
@@ -177,6 +191,7 @@ public sealed partial class MainWindow : Window
         _mode.Toggled += (_, _) => { if (_coordinator.IsRunning) return; StopSentRecording(); _settings.DemoMode = _mode.IsOn; _repository.SaveSettings(_settings); ShowHome(); };
         _scene = Ui.Combo("祝福场景", ["春节", "元旦", "中秋", "端午", "生日", "纪念日", "通用问候"], _settings.Scene);
         _scene.IsEditable = true; _scene.Text = _settings.Scene;
+        _zodiac = BuildZodiacSelector(_scene);
         _extra = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：给老师，朴素一点；加 1–2 个 Emoji"); _extra.MaxLength = 300;
         _extra.AcceptsReturn = true; _extra.Height = 86;
         _startButton = Ui.Button(_settings.DemoMode || _settings.EnableLiveAppend ? "✦  生成并预填草稿" : "✦  生成祝福", () => _ = StartTaskAsync(), true);
@@ -186,7 +201,7 @@ public sealed partial class MainWindow : Window
         _progressDetail = Ui.Text(_settings.DemoMode ? "先体验完整流程，随后在设置中连接你的模型。" : "先配置 API 并选择目标微信窗口。", 12, "7C8981");
         _progressBar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 4, Foreground = Ui.Brush("258260") };
         var form = Ui.Stack(14, Ui.Text("生成一条合适的祝福", 19, bold: true), _mode,
-            _scene, _extra, Columns(_startButton, _cancelButton, 3, 1),
+            _scene, _zodiac, _extra, Columns(_startButton, _cancelButton, 3, 1),
             Ui.Stack(7, _progressTitle, _progressDetail, _progressBar));
         if (!_settings.DemoMode)
         {
@@ -223,6 +238,31 @@ public sealed partial class MainWindow : Window
         _runningHomeView = Present(Ui.Stack(22, header, _notice, body));
         if (_lastTaskProgress is { } progress) ShowProgress(progress.Stage, progress.Detail, progress.Percent);
         if (_lastTaskNotice is { } notice) Notify(notice.Text, notice.Severity);
+    }
+
+    private ComboBox BuildZodiacSelector(ComboBox scene)
+    {
+        var zodiac = Ui.Combo("生肖年", HolidayZodiac.Years, HolidayZodiac.ResolveYear(_settings.ZodiacYear));
+        void UpdateVisibility(string sceneName) =>
+            zodiac.Visibility = HolidayZodiac.AppliesTo(sceneName) ? Visibility.Visible : Visibility.Collapsed;
+
+        UpdateVisibility(scene.Text);
+        scene.SelectionChanged += (_, args) => UpdateVisibility(args.AddedItems.FirstOrDefault() as string ?? scene.Text);
+        scene.TextSubmitted += (_, args) => UpdateVisibility(args.Text);
+        zodiac.SelectionChanged += (_, _) =>
+        {
+            if (zodiac.SelectedItem is not string selected) return;
+            var previous = HolidayZodiac.ResolveYear(_settings.ZodiacYear);
+            if (selected == previous) return;
+            var next = _settings with { ZodiacYear = selected };
+            try { _repository.SaveSettings(next); _settings = next; }
+            catch (Exception e)
+            {
+                zodiac.SelectedItem = previous;
+                Notify("生肖年未保存：" + e.Message, InfoBarSeverity.Warning);
+            }
+        };
+        return zodiac;
     }
 
     private UIElement BuildDemoChat()
@@ -272,6 +312,8 @@ public sealed partial class MainWindow : Window
         {
             RefreshWindows();
             if (_windows?.SelectedItem is not WechatWindow window) { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
+            if (!await ConfirmScreenshotUploadAsync() || IsTaskBusy) return;
+            taskSettings = _settings with { };
             adapter = CreateConversationAdapter(window.Handle, taskSettings);
         }
         _runCancellation = new CancellationTokenSource(); SetBusy(true);
@@ -401,6 +443,7 @@ public sealed partial class MainWindow : Window
         if (_checkVisionButton is not null) _checkVisionButton.IsEnabled = !busy;
         if (_prefill is not null) _prefill.IsEnabled = !busy;
         if (_windows is not null) _windows.IsEnabled = !busy;
+        if (_zodiac is not null) _zodiac.IsEnabled = !busy;
         if (_mode is not null) _mode.IsEnabled = !busy;
         foreach (var button in _idleActions) button.IsEnabled = !busy;
         _historyView?.SetTaskBusy(busy);
@@ -436,9 +479,19 @@ public sealed partial class MainWindow : Window
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("打开祝语", null, (_, _) => DispatcherQueue.TryEnqueue(Activate));
         menu.Items.Add("暂停 / 恢复快捷键", null, (_, _) => DispatcherQueue.TryEnqueue(() =>
-        { _paused = !_paused; if (_paused) _hotkey?.Pause(); else _hotkey?.Register(_settings.HotkeyVirtualKey); _footer.Text = _paused ? "快捷键已暂停" : "Ctrl + Alt + " + (char)_settings.HotkeyVirtualKey; }));
+        {
+            _paused = !_paused;
+            if (_paused) _hotkey?.Pause();
+            else _hotkey?.Register(_settings.GenerationHotkey);
+            UpdateHotkeyFooter();
+        }));
         menu.Items.Add("退出", null, (_, _) => DispatcherQueue.TryEnqueue(Close));
         _tray.ContextMenuStrip = menu; _tray.DoubleClick += (_, _) => DispatcherQueue.TryEnqueue(Activate);
+    }
+    private void UpdateHotkeyFooter()
+    {
+        _footer.Text = _paused ? "快捷键已暂停" :
+            _hotkey?.IsRegistered == true ? _settings.GenerationHotkey.ToString() : "快捷键不可用，请到设置修改";
     }
     private async Task<bool> ConfirmAsync(string title, string message)
     {

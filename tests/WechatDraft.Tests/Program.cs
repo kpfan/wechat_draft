@@ -26,16 +26,101 @@ var examples = new ExampleService();
 var examplePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../config/blessing_examples.json"));
 examples.Load(examplePath);
 var settings = new AppSettings { Scene = "生日", DemoMode = true };
+await Test("Hotkey validates and formats captured key combinations", () =>
+{
+    var chord = new HotkeyShortcut(HotkeyModifiers.Control | HotkeyModifiers.Shift, 'G');
+    True(chord.IsValid, "custom shortcut was rejected");
+    Equal("Ctrl + Shift + G", chord.ToString());
+    True(new HotkeyShortcut(HotkeyModifiers.Windows | HotkeyModifiers.Alt, '7').IsValid, "modified digit was rejected");
+    var function = new HotkeyShortcut(HotkeyModifiers.None, 0x78);
+    True(function.IsValid, "standalone function key was rejected");
+    Equal("F9", function.ToString());
+    True(!new HotkeyShortcut(HotkeyModifiers.None, 'B').IsValid, "bare letter accepted");
+    True(!new HotkeyShortcut(HotkeyModifiers.Control, 0x7B).IsValid, "reserved F12 accepted");
+    return Task.CompletedTask;
+});
+await Test("Hotkey settings retain legacy combinations and round-trip custom ones", () =>
+{
+    var legacy = JsonSerializer.Deserialize<AppSettings>("""{"hotkeyVirtualKey":88}""", JsonDefaults.Options)!;
+    Equal("Ctrl + Alt + X", legacy.GenerationHotkey.ToString());
+    var hotkeyRepo = new LocalRepository(Path.Combine(root, "hotkey"), protector);
+    var updated = legacy with { HotkeyVirtualKey = 0x78, HotkeyModifiers = HotkeyModifiers.None };
+    hotkeyRepo.SaveSettings(updated);
+    Equal(updated.GenerationHotkey, hotkeyRepo.LoadSettings().GenerationHotkey);
+    return Task.CompletedTask;
+});
 foreach (var (name, run) in ApiProfileChecks.Cases(root, protector)) await Test(name, run);
+foreach (var (name, run) in ModelConfigPackageChecks.Cases(root, protector)) await Test(name, run);
+await Test("Demo defaults migrate to Xiao Ming while preserving edited contacts and history snapshots", () =>
+{
+    var repository = new LocalRepository(Path.Combine(root, "demo-defaults"), protector);
+    Contact OldDemo(string name, string relationship, string scope = "default") => new()
+    {
+        DisplayName = name, RemarkName = name, AddressTerm = name, Relationship = relationship,
+        AccountScope = scope, IsDemo = true, Confirmed = true, BindingStatus = "demo"
+    };
+    var teacher = OldDemo("陈老师", "teacher");
+    var friend = OldDemo("小林", "friend");
+    var real = teacher with { Id = "real-teacher", IsDemo = false };
+    var edited = friend with { Id = "edited-demo", DisplayName = "演示朋友", AddressTermSource = "user" };
+    var otherScope = OldDemo("小林", "friend", "other");
+    foreach (var contact in new[] { teacher, friend, real, edited, otherScope }) repository.SaveContact(contact);
+    repository.SaveTask(new TaskRecord { ContactId = friend.Id, DisplayName = "小林", IsDemo = true });
+
+    var migrated = DemoContactDefaults.Load(repository, "default");
+    Equal(2, migrated.Count);
+    var xiaoMing = migrated.Single(c => c.Id == friend.Id);
+    Equal("小明", xiaoMing.DisplayName);
+    Equal("小明", xiaoMing.AddressTerm);
+    Equal(3, repository.Contacts("default").Count);
+    Equal("陈老师", repository.Contacts("default").Single(c => c.Id == real.Id).DisplayName);
+    Equal("小林", repository.Contacts("other").Single().DisplayName);
+    Equal("小林", repository.History("default").Single().DisplayName);
+    Equal(2, DemoContactDefaults.Load(repository, "default").Count);
+    Equal("小明", DemoContactDefaults.Load(repository, "fresh").Single().DisplayName);
+    return Task.CompletedTask;
+});
 foreach (var (name, run) in SentGreetingChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in ExampleChecks.Cases(examplePath)) await Test(name, run);
 foreach (var (name, run) in HistorySearchChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in LocalVisionChecks.Cases(root, examples, protector)) await Test(name, run);
 foreach (var (name, run) in VisionClipboardPollerChecks.Cases()) await Test(name, run);
 foreach (var (name, run) in VisionInputSettlerChecks.Cases()) await Test(name, run);
-foreach (var (name, run) in VisionInputRecheckChecks.Cases(root)) await Test(name, run);
+foreach (var (name, run) in VisionCurrentDraftChecks.Cases(root)) await Test(name, run);
 foreach (var (name, run) in OcrPrefillChecks.Cases(root, examples, protector)) await Test(name, run);
-foreach (var (name, run) in GreetingDiversityChecks.Cases(root, examples, protector)) await Test(name, run);
+await Test("Generation keeps past greetings local and accepts a matching response without retry", async () =>
+{
+    const string greeting = "陈老师，生日快乐！愿您在新的一岁里平安顺遂，每天都有值得期待的小事。";
+    var historyRepo = new LocalRepository(Path.Combine(root, "generation-with-history"), protector);
+    var contact = new Contact { DisplayName = "测试联系人", AddressTerm = "陈老师", AddressTermSource = "chat_message",
+        AddressEvidence = new() { Source = "chat_message", Speaker = "self", Quote = greeting, CaptureId = "old" } };
+    historyRepo.SaveContact(contact);
+    historyRepo.SaveTask(new() { ContactId = contact.Id, DisplayName = contact.DisplayName, Scene = "生日",
+        Greeting = greeting, GenerationStatus = "成功", CompletedAt = DateTimeOffset.UtcNow });
+    var handler = new StubHandler(request =>
+    {
+        using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+        var instruction = body.RootElement.GetProperty("messages")[1].GetProperty("content")[0].GetProperty("text").GetString()!;
+        using var prompt = JsonDocument.Parse(instruction);
+        var stored = prompt.RootElement.GetProperty("stored_contact");
+        True(!prompt.RootElement.TryGetProperty("variation", out _) && !instruction.Contains(greeting) &&
+            !stored.TryGetProperty("addressEvidence", out _), "Past greeting or saved evidence entered the request.");
+        Equal("陈老师", prompt.RootElement.GetProperty("salutation").GetProperty("required_address_term").GetString());
+        var reply = JsonSerializer.Serialize(new ModelResponse { ObservedDisplayName = contact.DisplayName, GreetingText = greeting });
+        return new(HttpStatusCode.OK)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = reply } } } }))
+        };
+    });
+    using var client = new CompatibleModelClient(handler);
+    var adapter = new FakeAdapter { IsDemo = false };
+    var result = await new TaskCoordinator(historyRepo, examples, protector).RunAsync(RealSettings(), adapter, client, null, default);
+    Equal("成功", result!.GenerationStatus);
+    Equal(greeting, result.Greeting);
+    Equal(1, handler.Calls);
+    Equal(1, adapter.Appends);
+    Equal(greeting, historyRepo.Contacts("default").Single().AddressEvidence!.Quote);
+});
 LocalRepository ContactRepository() => new(Path.Combine(root, "contacts-" + Guid.NewGuid().ToString("N")), protector);
 AppSettings RealSettings() => settings with { DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
 AddressEvidence ChatAddress(string quote, string captureId = "capture_0") => new() { Source = "chat_message", Speaker = "self", Quote = quote, CaptureId = captureId };
@@ -91,15 +176,15 @@ await Test("Debug task records link their artifacts only when capture is permitt
     Equal(DebugSession.IsSupported, result.DebugDirectory is not null);
     Equal(DebugSession.IsSupported, Directory.Exists(folder));
 });
-await Test("Append preserves whitespace and existing newline", () =>
+await Test("Append preserves whitespace and adds no separator", () =>
 {
-    Equal("祝福", DraftRules.Append("", "祝福")); Equal("原文\r\n祝福", DraftRules.Append("原文", "祝福"));
-    Equal("原文\n祝福", DraftRules.Append("原文\n", "祝福")); Equal(" \r\n祝福", DraftRules.Append(" ", "祝福"));
+    Equal("祝福", DraftRules.Append("", "祝福")); Equal("原文祝福", DraftRules.Append("原文", "祝福"));
+    Equal("原文\n祝福", DraftRules.Append("原文\n", "祝福")); Equal(" 祝福", DraftRules.Append(" ", "祝福"));
     Equal(" 原文 \r\n\r\n祝福", DraftRules.Append(" 原文 \r\n\r\n", "祝福")); return Task.CompletedTask;
 });
-await Test("Visible character limit counts emoji graphemes", () =>
+await Test("Visible character count treats a combined emoji as one grapheme", () =>
 {
-    Equal(1, DraftRules.VisibleLength("👨‍👩‍👧‍👦")); Throws(() => DraftRules.ValidateGreeting(new() { GreetingText = new string('祝', 121) })); return Task.CompletedTask;
+    Equal(1, DraftRules.VisibleLength("👨‍👩‍👧‍👦")); return Task.CompletedTask;
 });
 await Test("Reject placeholders, control characters, unknown relationships", () =>
 {
@@ -244,11 +329,36 @@ await Test("Example reload retains last valid version", () =>
     var version = examples.Version; var file = Path.Combine(root, "bad.json"); File.WriteAllText(file, "broken");
     Equal(false, examples.TryReload(file)); Equal(version, examples.Version); return Task.CompletedTask;
 });
-await Test("Four capture maximum, three scroll maximum", async () =>
+await Test("Two scrolls collect the initial and two older screenshots in one request", async () =>
 {
-    var adapter = new FakeAdapter(); var model = new FakeModel { NeedsMore = true }; var coordinator = new TaskCoordinator(repo, examples, protector);
-    var result = await coordinator.RunAsync(settings, adapter, model, null, default);
-    Equal(4, result!.CaptureCount); Equal(3, result.ScrollCount); Equal(1, adapter.Appends); Equal(4, model.Calls);
+    var adapter = new FakeAdapter { IsDemo = false };
+    var handler = new StubHandler(request =>
+    {
+        Equal(2, adapter.Scrolls);
+        using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+        var images = json.RootElement.GetProperty("messages")[1].GetProperty("content").EnumerateArray()
+            .Where(item => item.GetProperty("type").GetString() == "image_url")
+            .Select(item => item.GetProperty("image_url").GetProperty("url").GetString()).ToArray();
+        Equal(3, images.Length);
+        for (var i = 0; i < images.Length; i++)
+            Equal("data:image/png;base64," + Convert.ToBase64String([(byte)i]), images[i]);
+        var reply = JsonSerializer.Serialize(new ModelResponse { ObservedDisplayName = adapter.DisplayName,
+            GreetingText = "生日快乐！愿你新的一岁平安顺心，每天都能遇到值得期待的小事。", ContextSufficient = true });
+        return new(HttpStatusCode.OK)
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = reply } } } }))
+        };
+    });
+    using var model = new CompatibleModelClient(handler);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    Equal(3, result!.CaptureCount); Equal(2, result.ScrollCount); Equal(1, adapter.Appends); Equal(1, handler.Calls);
+});
+await Test("An unchanged screenshot ends collection without sending a duplicate", async () =>
+{
+    var adapter = new FakeAdapter { RepeatCapture = true };
+    var model = new FakeModel();
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    Equal(1, result!.CaptureCount); Equal(1, adapter.Scrolls); Equal(1, model.Calls); Equal(true, model.LastFinalRound);
 });
 await Test("Input inspection failure ends progress and never calls the model", async () =>
 {
@@ -446,11 +556,27 @@ await Test("A same-title replacement chat view keeps the generated greeting with
     Equal("成功", result!.GenerationStatus); Equal(true, result.ScreenshotRecipientMatched);
     Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId); True(result.Greeting.Length > 0, "greeting lost");
 });
-await Test("Prefill is off in new profiles and survives a settings round trip when explicitly enabled", () =>
+await Test("New workspaces use the requested defaults while saved settings retain their preferences", () =>
 {
-    Equal(false, new AppSettings().EnableLiveAppend);
-    var preferences = ContactRepository(); preferences.SaveSettings(settings with { EnableLiveAppend = true });
-    Equal(true, preferences.LoadSettings().EnableLiveAppend); return Task.CompletedTask;
+    var preferences = ContactRepository();
+    var defaults = preferences.LoadSettings();
+    Equal("vision", defaults.AutomationMode);
+    Equal("default", defaults.AccountScope);
+    Equal("Ctrl + Shift + A", defaults.GenerationHotkey.ToString());
+    Equal(90, defaults.RetentionDays);
+    Equal(true, defaults.EnableLiveAppend);
+
+    var legacy = JsonSerializer.Deserialize<AppSettings>("{}", JsonDefaults.Options)!;
+    Equal("auto", legacy.AutomationMode);
+    Equal(false, legacy.EnableLiveAppend);
+    Equal("Ctrl + Alt + B", legacy.GenerationHotkey.ToString());
+
+    preferences.SaveSettings(defaults with { AutomationMode = "uia", EnableLiveAppend = false, HotkeyVirtualKey = 'Z' });
+    var saved = preferences.LoadSettings();
+    Equal("uia", saved.AutomationMode);
+    Equal(false, saved.EnableLiveAppend);
+    Equal("Ctrl + Shift + Z", saved.GenerationHotkey.ToString());
+    return Task.CompletedTask;
 });
 await Test("Screenshot-only generation records unread drafts without claiming an empty original", async () =>
 {
@@ -462,11 +588,26 @@ await Test("Screenshot-only generation records unread drafts without claiming an
     Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends);
     True(progress.Any(stage => stage.Detail.Contains("未读取草稿")) && !progress.Any(stage => stage.Detail.Contains("保留原有 0")), "unread draft must not be reported as empty");
 });
-await Test("An unread original draft can never authorize automatic input", async () =>
+await Test("An unread draft without deferred reading cannot authorize automatic input", async () =>
 {
     var adapter = new FakeAdapter { OriginalTextRead = false }; var model = new FakeModel();
     var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
     Equal("失败", result!.GenerationStatus); Equal(0, model.Calls); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
+});
+await Test("Direct visual append generates from the frozen frame before checking live input", async () =>
+{
+    foreach (var stillSame in new[] { true, false })
+    {
+        var adapter = new FakeAdapter { TitleSource = "ocr", OriginalTextRead = false, DirectAppend = true,
+            CanCollectMoreContext = false, Valid = false, Result = new("已预填", "test") };
+        // Live state is unavailable until the model completes. The initial capture is already frozen.
+        var model = new FakeModel { BeforeReturn = () => adapter.Valid = stillSame };
+        var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+        Equal("成功", result!.GenerationStatus);
+        Equal(false, result.OriginalTextRead); Equal(null, result.OriginalPreserved); Equal(1, model.Calls);
+        Equal(stillSame ? "已预填" : "待手动处理", result.FillStatus);
+        Equal(stillSame ? 1 : 0, adapter.Appends); Equal(stillSame, result.AppendAttemptId is not null);
+    }
 });
 await Test("A frozen context is the final model round and never scrolls for more history", async () =>
 {
@@ -528,21 +669,33 @@ await Test("HTTP redirect does not forward bearer credentials", async () =>
 });
 await Test("GLM vision uses data-only function output and preserves bearer auth", async () =>
 {
-    var modelData = JsonSerializer.Serialize(new ModelResponse { GreetingText = "新春快乐，愿新的一年平安顺心！", ObservedDisplayName = "测试联系人" }, JsonDefaults.Options);
+    const string instruction = "写约 150 字，朴素一点";
+    var greeting = "新春快乐！" + string.Concat(Enumerable.Repeat("愿新的一年平安顺心，所盼皆如愿。", 9));
+    var modelData = JsonSerializer.Serialize(new ModelResponse { GreetingText = greeting, ObservedDisplayName = "测试联系人" }, JsonDefaults.Options);
     var handler = new StubHandler(request =>
     {
         Equal("Bearer", request.Headers.Authorization!.Scheme); Equal("test-key", request.Headers.Authorization.Parameter);
         using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
         Equal("disabled", body.RootElement.GetProperty("thinking").GetProperty("type").GetString());
         Equal("submit_draft", body.RootElement.GetProperty("tools")[0].GetProperty("function").GetProperty("name").GetString());
-        var prompt = body.RootElement.GetProperty("messages")[1].GetProperty("content")[0].GetProperty("text").GetString()!;
+        var messages = body.RootElement.GetProperty("messages");
+        var userContent = messages[1].GetProperty("content");
+        var prompt = userContent[0].GetProperty("text").GetString()!;
         True(prompt.Contains("春节") && !prompt.Contains("\\u6625"), "Chinese scene must remain readable inside prompt JSON");
+        using var parameters = JsonDocument.Parse(prompt);
+        Equal(instruction, parameters.RootElement.GetProperty("extra_requirement").GetString());
+        True(!parameters.RootElement.TryGetProperty("target_length", out _) && !parameters.RootElement.TryGetProperty("hard_max", out _),
+            "the request must leave the greeting length to the user's instruction");
+        var greetingSchema = body.RootElement.GetProperty("tools")[0].GetProperty("function")
+            .GetProperty("parameters").GetProperty("properties").GetProperty("greeting_text");
+        foreach (var text in new[] { messages[0].GetProperty("content").GetString()!, userContent.EnumerateArray().Last().GetProperty("text").GetString()!, greetingSchema.GetRawText() })
+            True(!text.Contains("30至80") && !text.Contains("120"), "a fixed greeting length must not appear in the model instructions");
         True(!body.RootElement.TryGetProperty("response_format", out _), "vision must not use unsupported JSON mode");
         return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { finish_reason = "tool_calls", message = new { tool_calls = new[] { new { function = new { name = "submit_draft", arguments = modelData } } } } } } })) };
     });
     using var client = new CompatibleModelClient(handler);
-    var result = await client.GenerateAsync(new() { BaseUrl = "https://open.bigmodel.cn/api/paas/v4", Model = "GLM-4.6V-Flash" }, "test-key", [new("0", [1])], null, [], true, default);
-    Equal("测试联系人", result.ObservedDisplayName); Equal(1, handler.Calls);
+    var result = await client.GenerateAsync(new() { BaseUrl = "https://open.bigmodel.cn/api/paas/v4", Model = "GLM-4.6V-Flash", ExtraInstruction = instruction }, "test-key", [new("0", [1])], null, [], true, default);
+    Equal(greeting, result.GreetingText); Equal("测试联系人", result.ObservedDisplayName); Equal(1, handler.Calls);
 });
 await Test("Unknown function and truncated responses cannot become drafts", async () =>
 {
@@ -581,6 +734,36 @@ await Test("Generic vision providers retain standard JSON text protocol", async 
     using var client = new CompatibleModelClient(handler);
     var result = await client.GenerateAsync(new() { BaseUrl = "https://test.example/v1", Model = "vision", Scene = "生日" }, "", [new("0", [1])], null, [], true, default);
     Equal("生日快乐，愿你平安顺心！", result.GreetingText);
+});
+await Test("The saved zodiac applies to Spring Festival and New Year's Day only", async () =>
+{
+    Equal(12, HolidayZodiac.Years.Count);
+    Equal("马年", HolidayZodiac.ForDate(new DateTime(2026, 11, 11)));
+    Equal("羊年", HolidayZodiac.ForDate(new DateTime(2027, 1, 1)));
+    Equal(HolidayZodiac.ForDate(DateTime.Today), HolidayZodiac.Resolve(new()));
+    var saved = new AppSettings { BaseUrl = "https://test.example/v1", Model = "vision", ZodiacYear = "羊年" };
+    var restored = JsonSerializer.Deserialize<AppSettings>(JsonSerializer.Serialize(saved, JsonDefaults.Options), JsonDefaults.Options)!;
+    foreach (var (scene, greeting) in new[]
+    {
+        ("春节", "新春快乐，愿你羊年如意！"),
+        ("元旦", "元旦快乐，也愿即将到来的羊年万事顺遂！"),
+        ("生日", "生日快乐，愿你天天开心！")
+    })
+    {
+        var handler = new StubHandler(request =>
+        {
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var prompt = body.RootElement.GetProperty("messages")[1].GetProperty("content")
+                .EnumerateArray().Last().GetProperty("text").GetString()!;
+            Equal(scene != "生日", prompt.Contains("本次选择的生肖年为羊年", StringComparison.Ordinal));
+            Equal(scene == "元旦", prompt.Contains("公历元旦", StringComparison.Ordinal));
+            var response = JsonSerializer.Serialize(new ModelResponse { GreetingText = greeting }, JsonDefaults.Options);
+            return new(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = response } } } })) };
+        });
+        using var client = new CompatibleModelClient(handler);
+        var result = await client.GenerateAsync(restored with { Scene = scene }, "", [new("0", [1])], null, [], true, default);
+        Equal(greeting, result.GreetingText);
+    }
 });
 await Test("Legacy tone preferences do not constrain new requests and custom style requirements remain available", async () =>
 {
@@ -796,13 +979,33 @@ await Test("Rate limit requires at least eight seconds cooldown", async () =>
     try { await client.GenerateAsync(new() { BaseUrl = "https://test.example/v1", Model = "vision" }, "", [new("0", [1])], null, [], true, default); throw new Exception("expected rate limit"); }
     catch (TransientApiException e) { True(e.RetryAfter >= TimeSpan.FromSeconds(8), "missing cooldown"); }
 });
-await Test("Known scene validation rejects a New Year greeting for Mid-Autumn", () =>
+await Test("The selected scene guides the model without blocking or retrying a draft based on its wording", async () =>
 {
-    Throws(() => DraftRules.ValidateSceneGreeting("新的一年平安顺心！", "中秋"));
-    DraftRules.ValidateSceneGreeting("中秋快乐，愿月圆人安！", "中秋");
-    DraftRules.ValidateSceneGreeting("愿新的一岁顺心！", "生日");
-    DraftRules.ValidateSceneGreeting("一切顺利！", "自定义场景");
-    return Task.CompletedTask;
+    foreach (var greeting in new[] { "愿你阖家安康，事事顺意！", "生日快乐，愿你平安顺心！" })
+    {
+        var handler = new StubHandler(request =>
+        {
+            using var body = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+            var prompt = body.RootElement.GetProperty("messages")[1].GetProperty("content")
+                .EnumerateArray().Last().GetProperty("text").GetString()!;
+            True(prompt.Contains("本次祝福场景为\"春节\"") && prompt.Contains("马年"),
+                "The request should retain the scene and zodiac.");
+            True(!prompt.Contains("当前场景用语"), "The request should allow natural wording.");
+            var response = JsonSerializer.Serialize(new ModelResponse { GreetingText = greeting }, JsonDefaults.Options);
+            return new(HttpStatusCode.OK)
+            {
+                Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = response } } } }))
+            };
+        });
+        using var client = new CompatibleModelClient(handler);
+        var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", CanCollectMoreContext = false };
+        var result = await new TaskCoordinator(repo, examples, protector).RunAsync(
+            RealSettings() with { Scene = "春节", ZodiacYear = "马年" }, adapter, client, null, default);
+        Equal(1, handler.Calls);
+        Equal(1, result!.ApiCallCount);
+        Equal(1, adapter.Appends);
+        Equal(greeting, result.Greeting);
+    }
 });
 await Test("Provider quota errors do not retry or expose error message secrets", async () =>
 {
@@ -978,7 +1181,7 @@ await Test("Visual append preserves whitespace and pastes only the suffix once",
     var original = "第一行\r\n第二行  "; var pasted = ""; var reads = 0; var writes = 0;
     var result = await VisionDraftAppender.AppendAsync(original, "祝福", _ => Task.FromResult(++reads == 1 ? original : original + pasted),
         (suffix, _) => { pasted = suffix; writes++; return Task.CompletedTask; }, default);
-    Equal("\r\n祝福", pasted); Equal(1, writes); Equal(2, reads); Equal(true, result.OriginalPreserved);
+    Equal("祝福", pasted); Equal(1, writes); Equal(2, reads); Equal(true, result.OriginalPreserved);
 });
 await Test("Visual append stops before paste when the complete draft changed", async () =>
 {
@@ -990,7 +1193,7 @@ await Test("Visual append stops before paste when the complete draft changed", a
 await Test("Visual append readback mismatch does not retry or claim preservation", async () =>
 {
     var reads = 0; var writes = 0;
-    var result = await VisionDraftAppender.AppendAsync("原文", "祝福", _ => Task.FromResult(++reads == 1 ? "原文" : "原文祝福"),
+    var result = await VisionDraftAppender.AppendAsync("原文", "祝福", _ => Task.FromResult(++reads == 1 ? "原文" : "原文祝福其他"),
         (_, _) => { writes++; return Task.CompletedTask; }, default);
     Equal(1, writes); Equal("预填结果待确认", result.Status); Equal(null, result.OriginalPreserved);
 });
@@ -1131,10 +1334,12 @@ sealed class FakeAdapter : IConversationAdapter
     public Func<CancellationToken, Task<bool>>? WaitForAppend { get; set; }
     public bool IsDemo { get; init; } = true;
     public bool OriginalTextRead { get; init; } = true;
+    public bool DirectAppend { get; init; }
     public bool DisplayNameRead { get; init; } = true;
     public string DisplayName { get; init; } = "测试联系人";
     public string TitleSource { get; init; } = "uia";
     public bool CanCollectMoreContext { get; init; } = true;
+    public bool RepeatCapture { get; init; }
     public bool RequiresConversationCheck { get; init; }
     public int Scrolls;
     public Exception? BeginError { get; init; }
@@ -1146,9 +1351,10 @@ sealed class FakeAdapter : IConversationAdapter
         OnBegin?.Invoke();
         if (BeginError is not null) throw BeginError;
         if (BeginDelayMs > 0) await Task.Delay(BeginDelayMs, ct);
-        return new ConversationSnapshot("session", DisplayName, "original", "window", IsDemo, OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource);
+        return new ConversationSnapshot("session", DisplayName, OriginalTextRead ? "original" : "", "window", IsDemo,
+            OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource) { DirectAppend = DirectAppend };
     }
-    public Task<Capture> CaptureAsync(ConversationSnapshot s, int index, CancellationToken ct) => Task.FromResult(new Capture("capture_" + index, [(byte)index], RequiresConversationCheck, TitleSource == "ocr" ? DisplayName : null));
+    public Task<Capture> CaptureAsync(ConversationSnapshot s, int index, CancellationToken ct) => Task.FromResult(new Capture("capture_" + index, [RepeatCapture ? (byte)0 : (byte)index], RequiresConversationCheck, TitleSource == "ocr" ? DisplayName : null));
     public Task<bool> ScrollUpAsync(ConversationSnapshot s, CancellationToken ct) { Scrolls++; return Task.FromResult(true); }
     public Task<bool> IsUnchangedAsync(ConversationSnapshot s, CancellationToken ct) => Task.FromResult(Valid);
     public Task<bool> WaitForAppendReadyAsync(ConversationSnapshot s, CancellationToken ct) => WaitForAppend?.Invoke(ct) ?? Task.FromResult(true);

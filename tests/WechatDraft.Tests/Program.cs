@@ -36,6 +36,7 @@ foreach (var (name, run) in VisionInputSettlerChecks.Cases()) await Test(name, r
 foreach (var (name, run) in VisionInputRecheckChecks.Cases(root)) await Test(name, run);
 foreach (var (name, run) in OcrPrefillChecks.Cases(root, examples, protector)) await Test(name, run);
 foreach (var (name, run) in GreetingDiversityChecks.Cases(root, examples, protector)) await Test(name, run);
+foreach (var (name, run) in ThirdVersionChecks.Cases(root)) await Test(name, run);
 LocalRepository ContactRepository() => new(Path.Combine(root, "contacts-" + Guid.NewGuid().ToString("N")), protector);
 AppSettings RealSettings() => settings with { DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
 AddressEvidence ChatAddress(string quote, string captureId = "capture_0") => new() { Source = "chat_message", Speaker = "self", Quote = quote, CaptureId = captureId };

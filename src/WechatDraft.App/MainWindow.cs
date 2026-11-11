@@ -55,7 +55,8 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
-        Title = "祝语 · 微信草稿助手";
+        Title = Environment.GetEnvironmentVariable("WECHAT_DRAFT_THIRD_VERSION") == "1"
+            ? "祝语 · 第三版本地实验" : "祝语 · 微信草稿助手";
         _dataDirectory = Environment.GetEnvironmentVariable("WECHAT_DRAFT_DATA") ?? Path.Combine(AppContext.BaseDirectory, "data");
         _repository = new LocalRepository(_dataDirectory, _protector);
         _settings = _repository.LoadSettings();
@@ -75,14 +76,15 @@ public sealed partial class MainWindow : Window
         _root.Children.Add(BuildSidebar()); Grid.SetColumn(_page, 1); _root.Children.Add(_page);
         Content = _root;
         ConfigureWindowLayout();
-        ShowHome();
+        if (Environment.GetEnvironmentVariable("WECHAT_DRAFT_THIRD_VERSION") == "1") ShowThirdVersion();
+        else ShowHome();
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _hotkey = new GlobalHotkey(hwnd);
         _hotkey.Pressed += () => DispatcherQueue.TryEnqueue(() => { if (!_paused) _ = StartTaskAsync(); });
         if (!_hotkey.Register(_settings.HotkeyVirtualKey)) _footer.Text = "快捷键冲突，请到设置修改";
         SetupTray();
         ConfigureWindowRefresh();
-        Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
+        Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); _thirdService?.Dispose(); };
     }
 
     private void SeedDemoContacts()
@@ -105,6 +107,7 @@ public sealed partial class MainWindow : Window
         logo.Margin = new Thickness(4, 14, 0, 10);
         var menu = Ui.Stack(9);
         AddNavigation(menu, "✦   生成祝福", ShowHome);
+        AddNavigation(menu, "◇   第三版实验", ShowThirdVersion);
         AddNavigation(menu, "◷   历史记录", ShowHistory);
         AddNavigation(menu, "✓   已发送祝福", ShowSentGreetings);
         AddNavigation(menu, "♧   联系人档案", ShowContacts);

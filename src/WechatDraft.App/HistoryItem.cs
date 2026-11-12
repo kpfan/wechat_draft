@@ -30,7 +30,6 @@ public sealed class HistoryItem
         };
         if (record.AddressTerm is not null) details.Add("称呼来源：" + MainWindow.AddressSourceLabel(record.AddressTermSource));
         if (record.AddressEvidence is { } evidence) details.Add("聊天依据（你发出的消息）：" + evidence.Quote);
-        if (record.IsDemo) details.Add("演示记录 · 虚构联系人");
         if (record.ContactReused) details.Add("已按备注复用联系人档案");
         if (record.AutomationMethod is "uia" or "vision") details.Add(record.AutomationMethod == "vision" ? "纯视觉" : "UIA");
         if (record.FallbackReason.Length > 0) details.Add("视觉兜底原因：" + record.FallbackReason);

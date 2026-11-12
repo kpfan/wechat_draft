@@ -1,9 +1,14 @@
 namespace WechatDraft.Core;
 
 // A title is scoped visible evidence, not a permanent contact identity.
-public sealed class OcrPrefillGuard(string title)
+public sealed class OcrPrefillGuard
 {
-    public string Title { get; } = ValidateTitle(title);
+    public OcrPrefillGuard(string title) => Title = ValidateTitle(title);
+    private OcrPrefillGuard() { }
+
+    public static OcrPrefillGuard WithoutTitleCheck() => new();
+
+    public string? Title { get; }
     private string _reason = "";
     private int _writeIssued;
     public string Reason => Volatile.Read(ref _reason);

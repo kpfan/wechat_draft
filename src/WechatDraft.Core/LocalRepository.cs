@@ -112,8 +112,9 @@ public sealed class LocalRepository
         command.Parameters.AddWithValue("$p", Encode(record)); command.Parameters.AddWithValue("$id", record.Id);
         command.Parameters.AddWithValue("$scope", record.AccountScope); return command.ExecuteNonQuery() == 1;
     }
-    public List<SentGreetingRecord> SentGreetings(string scope, int limit = 200) => Read<SentGreetingRecord>(
-        "SELECT payload FROM sent_greetings WHERE scope=$scope ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000), scope);
+    public List<SentGreetingRecord> SentGreetings(string scope, int limit = 200, bool includeDemo = true) => Read<SentGreetingRecord>(
+        "SELECT payload FROM sent_greetings WHERE scope=$scope ORDER BY created DESC", scope,
+        includeDemo ? null : record => !record.IsDemo, Math.Clamp(limit, 1, 100000));
     public void DeleteSentGreeting(string id) => Write("DELETE FROM sent_greetings WHERE id=$id", ("$id", id));
     public void ClearSentGreetings(string scope) => Write("DELETE FROM sent_greetings WHERE scope=$scope", ("$scope", scope));
     public void Cleanup(int retentionDays)
@@ -135,12 +136,16 @@ public sealed class LocalRepository
             task.CompletedAt = DateTimeOffset.UtcNow; SaveTask(task);
         }
     }
-    private List<T> Read<T>(string sql, string? scope)
+    private List<T> Read<T>(string sql, string? scope, Func<T, bool>? include = null, int limit = int.MaxValue)
     {
         using var db = Open(); using var command = db.CreateCommand(); command.CommandText = sql;
         if (scope is not null) command.Parameters.AddWithValue("$scope", scope);
         using var reader = command.ExecuteReader(); var result = new List<T>();
-        while (reader.Read()) result.Add(Decode<T>(reader.GetString(0)));
+        while (result.Count < limit && reader.Read())
+        {
+            var record = Decode<T>(reader.GetString(0));
+            if (include is null || include(record)) result.Add(record);
+        }
         return result;
     }
     private string Encode<T>(T value) => _protector.Protect(JsonSerializer.Serialize(value, JsonDefaults.Options));

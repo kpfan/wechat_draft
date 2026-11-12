@@ -6,7 +6,7 @@ using WechatDraft.Windows;
 
 internal static class SentGreetingChecks
 {
-    private static readonly AppSettings Configuration = new() { DemoMode = false, BaseUrl = "https://test.example/v1",
+    private static readonly AppSettings Configuration = new() { BaseUrl = "https://test.example/v1",
         AuthorizedOrigin = "https://test.example", Model = "fake-vision" };
     private static SentGreetingResponse Good(string text = "祝你生日快乐！") => new()
     {
@@ -169,7 +169,7 @@ internal static class SentGreetingChecks
         {
             var repo = Repository(); var model = new FakeSentModel(Good()); var archiver = new SentGreetingArchiver(repo, protector, model);
             await RejectAsync(() => archiver.ProcessAsync(Configuration with { AuthorizedOrigin = "https://other.example" }, Observation(), default));
-            await RejectAsync(() => archiver.ProcessAsync(Configuration with { DemoMode = true }, Observation(), default));
+            await RejectAsync(() => archiver.ProcessAsync(Configuration with { AuthorizedOrigin = "" }, Observation(), default));
             await RejectAsync(() => archiver.ProcessAsync(Configuration, Observation() with { Before = new("large", new byte[12 * 1024 * 1024]) }, default));
             Equal(0, model.Calls); Equal(0, repo.SentGreetings("default").Count);
         });

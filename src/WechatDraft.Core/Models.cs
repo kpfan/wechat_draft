@@ -29,7 +29,6 @@ public sealed record AppSettings : IJsonOnDeserializing
     public string Scene { get; set; } = "春节";
     public string? ZodiacYear { get; set; }
     public string ExtraInstruction { get; set; } = "";
-    public bool DemoMode { get; set; } = true;
     public bool DebugMode { get; set; }
     public bool AllowLoopbackHttp { get; set; }
     public bool EnableLiveAppend { get; set; } = true;
@@ -168,11 +167,15 @@ public sealed record ModelResponse
     [JsonPropertyName("warnings")] public string[] Warnings { get; init; } = [];
 }
 
-public sealed record Capture(string Id, byte[] PngBytes, bool RequiresConversationCheck = false, string? LocalTitle = null);
+public sealed record Capture(string Id, byte[] PngBytes, bool RequiresConversationCheck = false, string? LocalTitle = null)
+{
+    public bool ForceGeneration { get; init; }
+}
 public sealed record ConversationSnapshot(string SessionToken, string DisplayName, string OriginalText,
-    string WindowIdentity, bool IsDemo, object? NativeState = null, bool OriginalTextRead = true, bool DisplayNameRead = true, string TitleSource = "uia")
+    string WindowIdentity, object? NativeState = null, bool OriginalTextRead = true, bool DisplayNameRead = true, string TitleSource = "uia")
 {
     public bool DirectAppend { get; init; }
+    public bool ForceGeneration { get; init; }
 }
 public sealed record FillResult(string Status, string Message, bool? OriginalPreserved = null);
 public sealed record TaskProgress(string Stage, string Detail, int Percent);

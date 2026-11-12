@@ -25,7 +25,8 @@ var repo = new LocalRepository(root, protector);
 var examples = new ExampleService();
 var examplePath = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../config/blessing_examples.json"));
 examples.Load(examplePath);
-var settings = new AppSettings { Scene = "生日", DemoMode = true };
+var settings = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
+    AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
 await Test("Hotkey validates and formats captured key combinations", () =>
 {
     var chord = new HotkeyShortcut(HotkeyModifiers.Control | HotkeyModifiers.Shift, 'G');
@@ -51,34 +52,37 @@ await Test("Hotkey settings retain legacy combinations and round-trip custom one
 });
 foreach (var (name, run) in ApiProfileChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in ModelConfigPackageChecks.Cases(root, protector)) await Test(name, run);
-await Test("Demo defaults migrate to Xiao Ming while preserving edited contacts and history snapshots", () =>
+await Test("Legacy demo settings cannot bypass consent, and stored demo records stay isolated", async () =>
 {
-    var repository = new LocalRepository(Path.Combine(root, "demo-defaults"), protector);
-    Contact OldDemo(string name, string relationship, string scope = "default") => new()
-    {
-        DisplayName = name, RemarkName = name, AddressTerm = name, Relationship = relationship,
-        AccountScope = scope, IsDemo = true, Confirmed = true, BindingStatus = "demo"
-    };
-    var teacher = OldDemo("陈老师", "teacher");
-    var friend = OldDemo("小林", "friend");
-    var real = teacher with { Id = "real-teacher", IsDemo = false };
-    var edited = friend with { Id = "edited-demo", DisplayName = "演示朋友", AddressTermSource = "user" };
-    var otherScope = OldDemo("小林", "friend", "other");
-    foreach (var contact in new[] { teacher, friend, real, edited, otherScope }) repository.SaveContact(contact);
-    repository.SaveTask(new TaskRecord { ContactId = friend.Id, DisplayName = "小林", IsDemo = true });
+    var repository = new LocalRepository(Path.Combine(root, "legacy-demo"), protector);
+    var legacy = JsonSerializer.Deserialize<AppSettings>(
+        """{"demoMode":true,"scene":"生日","baseUrl":"https://test.example/v1","extraInstruction":"保留此设置"}""",
+        JsonDefaults.Options)!;
+    repository.SaveSettings(legacy);
+    var restored = repository.LoadSettings();
+    Equal("保留此设置", restored.ExtraInstruction);
+    var adapter = new FakeAdapter { OnBegin = () => throw new Exception("Accessed the conversation before consent.") };
+    var model = new FakeModel();
+    var result = await new TaskCoordinator(repository, examples, protector).RunAsync(restored, adapter, model, default);
+    Equal("失败", result!.GenerationStatus);
+    True(result.Error.Contains("授权"), "Legacy settings bypassed screenshot authorization.");
+    Equal(0, model.Calls);
+    Equal(0, repository.Contacts("default").Count);
 
-    var migrated = DemoContactDefaults.Load(repository, "default");
-    Equal(2, migrated.Count);
-    var xiaoMing = migrated.Single(c => c.Id == friend.Id);
-    Equal("小明", xiaoMing.DisplayName);
-    Equal("小明", xiaoMing.AddressTerm);
-    Equal(3, repository.Contacts("default").Count);
-    Equal("陈老师", repository.Contacts("default").Single(c => c.Id == real.Id).DisplayName);
-    Equal("小林", repository.Contacts("other").Single().DisplayName);
-    Equal("小林", repository.History("default").Single().DisplayName);
-    Equal(2, DemoContactDefaults.Load(repository, "default").Count);
-    Equal("小明", DemoContactDefaults.Load(repository, "fresh").Single().DisplayName);
-    return Task.CompletedTask;
+    var demo = new Contact
+    {
+        DisplayName = "小明", RemarkName = "小明", IsDemo = true, Confirmed = true, BindingStatus = "demo"
+    };
+    repository.SaveContact(demo);
+    repository.SaveTask(new TaskRecord { ContactId = demo.Id, DisplayName = demo.DisplayName, IsDemo = true });
+    repository.SaveSentGreeting(new SentGreetingRecord { Id = "real", ObservedAt = DateTimeOffset.UtcNow.AddMinutes(-1) });
+    repository.SaveSentGreeting(new SentGreetingRecord { Id = "legacy", IsDemo = true });
+    Equal(null, repository.FindContactByName("default", demo.DisplayName));
+    Equal(1, repository.Contacts("default").Count);
+    Equal(1, (await new HistorySearchSession(repository, "default").SearchAsync(new HistoryFilter { IsDemo = false }, 0, 10)).Records.Count);
+    Equal(2, repository.History("default").Count);
+    Equal("real", repository.SentGreetings("default", 1, includeDemo: false).Single().Id);
+    Equal(2, repository.SentGreetings("default").Count);
 });
 foreach (var (name, run) in SentGreetingChecks.Cases(root, protector)) await Test(name, run);
 foreach (var (name, run) in ExampleChecks.Cases(examplePath)) await Test(name, run);
@@ -113,8 +117,8 @@ await Test("Generation keeps past greetings local and accepts a matching respons
         };
     });
     using var client = new CompatibleModelClient(handler);
-    var adapter = new FakeAdapter { IsDemo = false };
-    var result = await new TaskCoordinator(historyRepo, examples, protector).RunAsync(RealSettings(), adapter, client, null, default);
+    var adapter = new FakeAdapter();
+    var result = await new TaskCoordinator(historyRepo, examples, protector).RunAsync(RealSettings(), adapter, client, default);
     Equal("成功", result!.GenerationStatus);
     Equal(greeting, result.Greeting);
     Equal(1, handler.Calls);
@@ -122,7 +126,7 @@ await Test("Generation keeps past greetings local and accepts a matching respons
     Equal(greeting, historyRepo.Contacts("default").Single().AddressEvidence!.Quote);
 });
 LocalRepository ContactRepository() => new(Path.Combine(root, "contacts-" + Guid.NewGuid().ToString("N")), protector);
-AppSettings RealSettings() => settings with { DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", Model = "test-vision", EnableLiveAppend = true };
+AppSettings RealSettings() => settings with { };
 AddressEvidence ChatAddress(string quote, string captureId = "capture_0") => new() { Source = "chat_message", Speaker = "self", Quote = quote, CaptureId = captureId };
 
 await Test("Vision test images remain complete across desktop DPI contexts", () =>
@@ -171,7 +175,7 @@ await Test("Debug task records link their artifacts only when capture is permitt
 {
     var folder = Path.Combine(root, "debug-task-" + Guid.NewGuid().ToString("N"));
     var result = await new TaskCoordinator(repo, examples, protector, folder).RunAsync(settings with { DebugMode = true },
-        new FakeAdapter(), new FakeModel(), null, default);
+        new FakeAdapter(), new FakeModel(), default);
     Equal("成功", result!.GenerationStatus);
     Equal(DebugSession.IsSupported, result.DebugDirectory is not null);
     Equal(DebugSession.IsSupported, Directory.Exists(folder));
@@ -269,9 +273,9 @@ await Test("Repeated real tasks reuse the same unconfirmed contact and history r
 {
     var contacts = ContactRepository(); var coordinator = new TaskCoordinator(contacts, examples, protector);
     var firstModel = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "陈老师，生日快乐，愿您平安顺心！", RelationshipType = "teacher", IdentityLabel = "导师", AddressTerm = "陈老师", AddressEvidence = ChatAddress("陈老师，最近还好吗？"), ContextSufficient = true } };
-    var first = await coordinator.RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, firstModel, null, default);
+    var first = await coordinator.RunAsync(RealSettings(), new FakeAdapter(), firstModel, default);
     var secondModel = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "陈老师，生日快乐！愿您忙里有闲，往后常遇舒心的人与事。", RelationshipType = "friend", IdentityLabel = "朋友", AddressTerm = "小陈", ContextSufficient = true } };
-    var second = await coordinator.RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, secondModel, null, default);
+    var second = await coordinator.RunAsync(RealSettings(), new FakeAdapter(), secondModel, default);
     Equal("成功", first!.GenerationStatus); Equal("已预填", second!.FillStatus);
     Equal(false, first.ContactReused); Equal(true, second.ContactReused);
     Equal(first.ContactId, second.ContactId); Equal(first.ContactId, secondModel.LastContact!.Id);
@@ -296,7 +300,7 @@ await Test("Legacy unconfirmed profiles fill missing fields without overwriting 
 {
     var contacts = ContactRepository(); var saved = new Contact { DisplayName = "测试联系人", IdentityLabel = "前同事" }; contacts.SaveContact(saved);
     var model = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "张哥，生日快乐，愿您平安顺心！", RelationshipType = "colleague", IdentityLabel = "新推断", AddressTerm = "张哥", AddressEvidence = ChatAddress("张哥，周末有空吗？"), ContextSufficient = true } };
-    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, model, null, default);
+    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), new FakeAdapter(), model, default);
     Equal(saved.Id, result!.ContactId); Equal(true, result.ContactReused);
     var updated = contacts.Contacts("default").Single();
     Equal("colleague", updated.Relationship); Equal("前同事", updated.IdentityLabel); Equal("张哥", updated.AddressTerm); Equal("测试联系人", updated.RemarkName);
@@ -305,7 +309,7 @@ await Test("Confirmed empty contact fields stay unchanged when the model guesses
 {
     var contacts = ContactRepository(); var saved = new Contact { DisplayName = "旧显示名", RemarkName = "测试联系人", Confirmed = true }; contacts.SaveContact(saved);
     var model = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", GreetingText = "生日快乐，愿您平安顺心！", RelationshipType = "teacher", IdentityLabel = "老师", AddressTerm = "陈老师", ContextSufficient = true } };
-    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), new FakeAdapter { IsDemo = false }, model, null, default);
+    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), new FakeAdapter(), model, default);
     Equal(saved.Id, result!.ContactId); Equal("旧显示名", model.LastContact!.DisplayName);
     Equal("unknown", result.Relationship); Equal(null, result.IdentityLabel); Equal(null, result.AddressTerm);
     Equal(true, contacts.Contacts("default").Single().Confirmed);
@@ -313,9 +317,9 @@ await Test("Confirmed empty contact fields stay unchanged when the model guesses
 await Test("Screenshot mismatch does not enrich or duplicate an existing contact", async () =>
 {
     var contacts = ContactRepository(); var saved = new Contact { DisplayName = "测试联系人" }; contacts.SaveContact(saved);
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var model = new FakeModel { Response = new() { ObservedDisplayName = "其他聊天", GreetingText = "陈老师，生日快乐，愿您平安顺心！", RelationshipType = "teacher", AddressTerm = "陈老师", AddressEvidence = ChatAddress("陈老师，您好！") } };
-    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal(false, result!.ScreenshotRecipientMatched); Equal(0, adapter.Appends);
     var unchanged = contacts.Contacts("default").Single(); Equal(saved.Id, unchanged.Id); Equal("unknown", unchanged.Relationship); Equal(null, unchanged.AddressTerm);
 });
@@ -331,7 +335,7 @@ await Test("Example reload retains last valid version", () =>
 });
 await Test("Two scrolls collect the initial and two older screenshots in one request", async () =>
 {
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var handler = new StubHandler(request =>
     {
         Equal(2, adapter.Scrolls);
@@ -350,14 +354,14 @@ await Test("Two scrolls collect the initial and two older screenshots in one req
         };
     });
     using var model = new CompatibleModelClient(handler);
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal(3, result!.CaptureCount); Equal(2, result.ScrollCount); Equal(1, adapter.Appends); Equal(1, handler.Calls);
 });
 await Test("An unchanged screenshot ends collection without sending a duplicate", async () =>
 {
     var adapter = new FakeAdapter { RepeatCapture = true };
     var model = new FakeModel();
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal(1, result!.CaptureCount); Equal(1, adapter.Scrolls); Equal(1, model.Calls); Equal(true, model.LastFinalRound);
 });
 await Test("Input inspection failure ends progress and never calls the model", async () =>
@@ -365,10 +369,10 @@ await Test("Input inspection failure ends progress and never calls the model", a
     var coordinator = new TaskCoordinator(repo, examples, protector);
     TaskProgress? last = null; coordinator.Progress += p => last = p;
     var model = new FakeModel(); var adapter = new FakeAdapter { BeginError = new InvalidOperationException("input unavailable") };
-    var result = await coordinator.RunAsync(settings, adapter, model, null, default);
+    var result = await coordinator.RunAsync(settings, adapter, model, default);
     Equal("失败", result!.GenerationStatus); Equal("未预填", result.FillStatus); Equal(0, model.Calls); Equal(0, adapter.Appends);
     Equal("检查失败", last!.Stage); Equal("input unavailable", last.Detail); Equal(100, last.Percent); Equal(false, coordinator.IsRunning);
-    var retry = await coordinator.RunAsync(settings, new FakeAdapter(), new FakeModel(), null, default);
+    var retry = await coordinator.RunAsync(settings, new FakeAdapter(), new FakeModel(), default);
     Equal("成功", retry!.GenerationStatus); Equal("处理完成", last.Stage);
 });
 await Test("Cancelling input inspection publishes a completed cancelled state", async () =>
@@ -377,7 +381,7 @@ await Test("Cancelling input inspection publishes a completed cancelled state", 
     TaskProgress? last = null; coordinator.Progress += p => last = p;
     using var cancelled = new CancellationTokenSource();
     var model = new FakeModel(); var adapter = new FakeAdapter { BeginDelayMs = 10000 };
-    var pending = coordinator.RunAsync(settings, adapter, model, null, cancelled.Token);
+    var pending = coordinator.RunAsync(settings, adapter, model, cancelled.Token);
     cancelled.Cancel(); var result = await pending;
     Equal("取消", result!.GenerationStatus); Equal(0, model.Calls); Equal(0, adapter.Appends);
     Equal("已取消", last!.Stage); Equal(100, last.Percent); Equal(false, coordinator.IsRunning);
@@ -387,9 +391,9 @@ await Test("Waiting to return to WeChat keeps the greeting durable but creates n
     var taskRepository = ContactRepository();
     var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     var ready = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-    var adapter = new FakeAdapter { IsDemo = false, WaitForAppend = ct => { entered.SetResult(); return ready.Task.WaitAsync(ct); } };
+    var adapter = new FakeAdapter { WaitForAppend = ct => { entered.SetResult(); return ready.Task.WaitAsync(ct); } };
     var pending = new TaskCoordinator(taskRepository, examples, protector).RunAsync(RealSettings(), adapter,
-        new FakeModel { ObservedName = "测试联系人" }, null, default);
+        new FakeModel { ObservedName = "测试联系人" }, default);
     await entered.Task.WaitAsync(TimeSpan.FromSeconds(5));
     var stored = taskRepository.History("default", 10).Single();
     Equal("成功", stored.GenerationStatus); True(stored.Greeting.Length > 0, "generated greeting was not saved");
@@ -400,11 +404,11 @@ await Test("Waiting to return to WeChat keeps the greeting durable but creates n
 });
 await Test("A changed chat after returning from the assistant stops before creating write intent", async () =>
 {
-    var adapter = new FakeAdapter { IsDemo = false, StateChangeReason = "微信聊天或聊天控件已变化，已停止预填。" };
+    var adapter = new FakeAdapter { StateChangeReason = "微信聊天或聊天控件已变化，已停止预填。" };
     adapter.WaitForAppend = _ => { adapter.Valid = false; return Task.FromResult(true); };
     using var fallback = new FallbackConversationAdapter(adapter, () => throw new Exception("must not fall back"));
     var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), fallback,
-        new FakeModel { ObservedName = "测试联系人" }, null, default);
+        new FakeModel { ObservedName = "测试联系人" }, default);
     Equal("成功", result!.GenerationStatus); Equal(adapter.StateChangeReason, result.Error);
     Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends);
 });
@@ -413,55 +417,55 @@ await Test("Cancelling while waiting for WeChat preserves generation and never c
     using var cancellation = new CancellationTokenSource();
     var adapter = new FakeAdapter { WaitForAppend = ct => { cancellation.Cancel(); return Task.FromCanceled<bool>(ct); } };
     var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings, adapter,
-        new FakeModel(), null, cancellation.Token);
+        new FakeModel(), cancellation.Token);
     Equal("成功", result!.GenerationStatus); Equal("待手动处理", result.FillStatus);
     Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends); True(result.Greeting.Length > 0, "greeting lost on cancellation");
 });
 await Test("Readiness timeout returns its exact reason without a write attempt", async () =>
 {
     var adapter = new FakeAdapter { StateChangeReason = "等待返回微信超过 30 秒，未预填。", WaitForAppend = _ => Task.FromResult(false) };
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings, adapter, new FakeModel(), null, default);
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings, adapter, new FakeModel(), default);
     Equal("成功", result!.GenerationStatus); Equal(adapter.StateChangeReason, result.Error);
     Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends);
 });
 await Test("User modification prevents input even with successful generation", async () =>
 {
     var adapter = new FakeAdapter(); var model = new FakeModel { BeforeReturn = () => adapter.Valid = false };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal("待手动处理", result.FillStatus); Equal(0, adapter.Appends);
 });
 await Test("Disabled append generates without input intent", async () =>
 {
     var adapter = new FakeAdapter { CanAutoAppend = false };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), default);
     Equal("待手动处理", result!.FillStatus); Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends);
 });
 await Test("A real task with prefill disabled never writes even if its adapter can append", async () =>
 {
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings() with { EnableLiveAppend = false },
-        adapter, new FakeModel { ObservedName = "测试联系人" }, null, default);
+        adapter, new FakeModel { ObservedName = "测试联系人" }, default);
     Equal("成功", result!.GenerationStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
     True(result.Error.Contains("预填已关闭"), "disabled preference was ignored");
 });
 await Test("Changing the preference after a task starts cannot grant that task input permission", async () =>
 {
     var livePreferences = RealSettings() with { EnableLiveAppend = false };
-    var snapshotSettings = livePreferences with { }; var adapter = new FakeAdapter { IsDemo = false };
+    var snapshotSettings = livePreferences with { }; var adapter = new FakeAdapter();
     var model = new FakeModel { ObservedName = "测试联系人", BeforeReturn = () => livePreferences.EnableLiveAppend = true };
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(snapshotSettings, adapter, model, null, default);
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(snapshotSettings, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
 });
 await Test("Editing live settings from another page does not change an active task", async () =>
 {
     var live = RealSettings() with { Model = "model-before", Scene = "生日", ExtraInstruction = "原要求", AccountScope = "before" };
-    var adapter = new FakeAdapter { IsDemo = false, OnBegin = () =>
+    var adapter = new FakeAdapter { OnBegin = () =>
     {
         live.Model = "model-after"; live.Scene = "元旦"; live.ExtraInstruction = "下次要求";
         live.AccountScope = "after"; live.EnableLiveAppend = false;
     } };
     var model = new FakeModel { ObservedName = "测试联系人" };
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(live, adapter, model, null, default);
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(live, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal("model-before", result.Model); Equal("before", result.AccountScope);
     Equal("生日", result.Scene); Equal("原要求", model.LastSettings!.ExtraInstruction); Equal(true, model.LastSettings.EnableLiveAppend);
     Equal(1, adapter.Appends); Equal("model-after", live.Model);
@@ -473,26 +477,26 @@ await Test("Editing examples while a conversation is inspected preserves the tas
     var target = Path.Combine(root, "next-page-examples.json");
     var adapter = new FakeAdapter { OnBegin = () => source.Save(target, source.Library with { Examples = [] }) };
     var model = new FakeModel();
-    var result = await new TaskCoordinator(ContactRepository(), source, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(ContactRepository(), source, protector).RunAsync(settings, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal(version, result.ExamplesVersion);
     True(expected.SequenceEqual(result.ExampleIds) && expected.SequenceEqual(model.LastExamples.Select(item => item.Id)), "active task used the later library");
     Equal(0, source.Library.Examples.Count);
-    var next = await new TaskCoordinator(ContactRepository(), source, protector).RunAsync(settings, new FakeAdapter(), new FakeModel(), null, default);
+    var next = await new TaskCoordinator(ContactRepository(), source, protector).RunAsync(settings, new FakeAdapter(), new FakeModel(), default);
     Equal(source.Version, next!.ExamplesVersion); Equal(0, next.ExampleIds.Length);
 });
 await Test("An unverifiable conversation keeps the greeting without creating input intent", async () =>
 {
-    var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, AutoAppendUnavailableReason = "缺少可复查的会话选择标识。" };
+    var adapter = new FakeAdapter { CanAutoAppend = false, AutoAppendUnavailableReason = "缺少可复查的会话选择标识。" };
     var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), adapter,
-        new FakeModel { ObservedName = "测试联系人" }, null, default);
+        new FakeModel { ObservedName = "测试联系人" }, default);
     Equal("成功", result!.GenerationStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
     True(result.Greeting.Length > 0 && result.Error.Contains("会话选择标识"), "manual fallback lost the result or reason");
 });
 await Test("Identical displayed titles cannot authorize input after the conversation changes", async () =>
 {
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var model = new FakeModel { ObservedName = "测试联系人", BeforeReturn = () => adapter.Valid = false };
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal(true, result!.ScreenshotRecipientMatched); Equal("成功", result.GenerationStatus); Equal(0, adapter.Appends);
     Equal(null, result.AppendAttemptId); Equal("待手动处理", result.FillStatus);
 });
@@ -509,7 +513,7 @@ await Test("UIA runtime identities distinguish same-name conversations and repla
 await Test("The UIA append entry refuses input without a verified conversation snapshot", async () =>
 {
     using var adapter = new WechatAdapter(0, true);
-    var result = await adapter.AppendAsync(new("s", "同名联系人", "原文", "w", false), "祝福", default);
+    var result = await adapter.AppendAsync(new("s", "同名联系人", "原文", "w"), "祝福", default);
     Equal("待手动处理", result.Status); True(result.Message.Contains("会话"), "missing identity reason");
 });
 await Test("A live chat view remains verifiable when its selected list item is virtualized", () =>
@@ -549,10 +553,10 @@ await Test("Layouts without a verified chat view still require an unchanged sele
 await Test("A same-title replacement chat view keeps the generated greeting without writing", async () =>
 {
     var identity = new UiaConversationIdentity("header", "editor", "", "page/content-A");
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var model = new FakeModel { ObservedName = "测试联系人", BeforeReturn = () =>
         adapter.Valid = identity.Matches(identity with { ChatView = "page/content-B" }) };
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal(true, result.ScreenshotRecipientMatched);
     Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId); True(result.Greeting.Length > 0, "greeting lost");
 });
@@ -583,7 +587,7 @@ await Test("Screenshot-only generation records unread drafts without claiming an
     var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false };
     var coordinator = new TaskCoordinator(repo, examples, protector); var progress = new List<TaskProgress>();
     coordinator.Progress += progress.Add;
-    var result = await coordinator.RunAsync(settings, adapter, new FakeModel(), null, default);
+    var result = await coordinator.RunAsync(settings, adapter, new FakeModel(), default);
     Equal("成功", result!.GenerationStatus); Equal(false, result.OriginalTextRead); Equal(null, result.OriginalPreserved);
     Equal(null, result.AppendAttemptId); Equal(0, adapter.Appends);
     True(progress.Any(stage => stage.Detail.Contains("未读取草稿")) && !progress.Any(stage => stage.Detail.Contains("保留原有 0")), "unread draft must not be reported as empty");
@@ -591,7 +595,7 @@ await Test("Screenshot-only generation records unread drafts without claiming an
 await Test("An unread draft without deferred reading cannot authorize automatic input", async () =>
 {
     var adapter = new FakeAdapter { OriginalTextRead = false }; var model = new FakeModel();
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal("失败", result!.GenerationStatus); Equal(0, model.Calls); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
 });
 await Test("Direct visual append generates from the frozen frame before checking live input", async () =>
@@ -602,7 +606,7 @@ await Test("Direct visual append generates from the frozen frame before checking
             CanCollectMoreContext = false, Valid = false, Result = new("已预填", "test") };
         // Live state is unavailable until the model completes. The initial capture is already frozen.
         var model = new FakeModel { BeforeReturn = () => adapter.Valid = stillSame };
-        var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+        var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
         Equal("成功", result!.GenerationStatus);
         Equal(false, result.OriginalTextRead); Equal(null, result.OriginalPreserved); Equal(1, model.Calls);
         Equal(stillSame ? "已预填" : "待手动处理", result.FillStatus);
@@ -613,7 +617,7 @@ await Test("A frozen context is the final model round and never scrolls for more
 {
     var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false, CanCollectMoreContext = false };
     var model = new FakeModel { NeedsMore = true };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal(1, model.Calls); Equal(true, model.LastFinalRound);
     Equal(1, result.CaptureCount); Equal(0, adapter.Scrolls); Equal(0, adapter.Appends);
 });
@@ -621,17 +625,17 @@ await Test("Enabling append after screenshot-only generation cannot promote an u
 {
     var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false };
     var model = new FakeModel { BeforeReturn = () => adapter.CanAutoAppend = true };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal("成功", result!.GenerationStatus); Equal("待手动处理", result.FillStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
     using var client = new CompatibleModelClient(new StubHandler(_ => throw new Exception("must not call")));
     using var visual = new WechatVisionAdapter(0);
-    var rejected = await visual.AppendAsync(new("s", "联系人", "", "w", false, OriginalTextRead: false), "祝福", default);
+    var rejected = await visual.AppendAsync(new("s", "联系人", "", "w", OriginalTextRead: false), "祝福", default);
     Equal("待手动处理", rejected.Status);
 });
 await Test("Uncertain input result is never replayed", async () =>
 {
     var adapter = new FakeAdapter { Result = new("预填结果待确认", "test") };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), default);
     Equal(1, adapter.Appends); Equal("预填结果待确认", result!.FillStatus);
     True(result.AppendAttemptId is not null, "missing durable input intent");
 });
@@ -639,20 +643,20 @@ await Test("Cancel ignores late model result", async () =>
 {
     using var cancellation = new CancellationTokenSource(); var adapter = new FakeAdapter();
     var model = new FakeModel { BeforeReturn = cancellation.Cancel };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, cancellation.Token);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, cancellation.Token);
     Equal(0, adapter.Appends); True(result!.Error.Contains("取消"), "missing cancelled status");
 });
 await Test("Rapid trigger never starts a second task", async () =>
 {
     var coordinator = new TaskCoordinator(repo, examples, protector); var model = new FakeModel { DelayMs = 100 };
-    var first = coordinator.RunAsync(settings, new FakeAdapter(), model, null, default);
-    var second = await coordinator.RunAsync(settings, new FakeAdapter(), model, null, default);
+    var first = coordinator.RunAsync(settings, new FakeAdapter(), model, default);
+    var second = await coordinator.RunAsync(settings, new FakeAdapter(), model, default);
     Equal(null, second); await first; Equal(1, model.Calls);
 });
 await Test("Persistent invalid model format only regenerates once", async () =>
 {
     var model = new FakeModel { Invalid = true }; var adapter = new FakeAdapter();
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, model, default);
     Equal(2, model.Calls); Equal(0, adapter.Appends); Equal("失败", result!.GenerationStatus);
 });
 await Test("Recovery marks issued input as uncertain without replay", () =>
@@ -850,10 +854,10 @@ await Test("Known salutations belong in the greeting itself and saved values tak
 await Test("A missing salutation regenerates once and only the corrected greeting is appended", async () =>
 {
     var contacts = ContactRepository(); contacts.SaveContact(new() { DisplayName = "测试联系人", AddressTerm = "陈老师", AddressTermSource = "user" });
-    var adapter = new FakeAdapter { IsDemo = false }; var model = new FakeModel();
+    var adapter = new FakeAdapter(); var model = new FakeModel();
     model.BeforeReturn = () => model.Response = new() { ObservedDisplayName = "测试联系人", ContextSufficient = true,
         GreetingText = model.Calls == 1 ? "生日快乐，愿您平安顺心！" : "陈老师，生日快乐，愿您平安顺心！" };
-    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal(2, model.Calls); Equal(1, adapter.Appends); Equal("已预填", result!.FillStatus);
     True(result.Greeting.StartsWith("陈老师"), "uncorrected greeting was used");
 });
@@ -862,9 +866,9 @@ await Test("Repeatedly missing or conflicting salutations never write or change 
     foreach (var text in new[] { "生日快乐，愿您平安顺心！", "王老师，生日快乐，愿您平安顺心！" })
     {
         var contacts = ContactRepository(); contacts.SaveContact(new() { DisplayName = "测试联系人", AddressTerm = "陈老师", Confirmed = true });
-        var adapter = new FakeAdapter { IsDemo = false };
+        var adapter = new FakeAdapter();
         var model = new FakeModel { Response = new() { GreetingText = text, AddressTerm = "王老师", ObservedDisplayName = "测试联系人" } };
-        var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+        var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, default);
         Equal(2, model.Calls); Equal(0, adapter.Appends); Equal("失败", result!.GenerationStatus);
         Equal(null, result.AppendAttemptId); Equal("陈老师", contacts.Contacts("default").Single().AddressTerm);
     }
@@ -907,15 +911,15 @@ await Test("Legacy salutation candidates stay stored but cannot influence a new 
 {
     var contacts = ContactRepository();
     var legacy = new Contact { DisplayName = "测试联系人", AddressTerm = "标题误当称呼", Relationship = "teacher" }; contacts.SaveContact(legacy);
-    var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false };
+    var adapter = new FakeAdapter { CanAutoAppend = false };
     var neutral = new FakeModel { ObservedName = "测试联系人" };
     var coordinator = new TaskCoordinator(contacts, examples, protector);
-    var first = await coordinator.RunAsync(RealSettings(), adapter, neutral, null, default);
+    var first = await coordinator.RunAsync(RealSettings(), adapter, neutral, default);
     Equal("成功", first!.GenerationStatus); Equal(null, neutral.LastContact!.AddressTerm); Equal("teacher", neutral.LastContact.Relationship);
     Equal(null, first.AddressTerm); Equal("标题误当称呼", contacts.Contacts("default").Single().AddressTerm);
     var inferred = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", AddressTerm = "陈老师",
         AddressEvidence = ChatAddress("陈老师，您好！"), GreetingText = "陈老师，生日快乐，愿您平安顺心！" } };
-    var second = await coordinator.RunAsync(RealSettings(), adapter, inferred, null, default);
+    var second = await coordinator.RunAsync(RealSettings(), adapter, inferred, default);
     Equal("成功", second!.GenerationStatus); Equal(legacy.Id, second.ContactId);
     var updated = contacts.Contacts("default").Single(); Equal("陈老师", updated.AddressTerm); Equal("chat_message", updated.AddressTermSource);
     Equal(updated.AddressEvidence, second.AddressEvidence); Equal("chat_message", second.AddressTermSource);
@@ -939,9 +943,9 @@ await Test("Unproven saved salutations are removed from both request preferences
 await Test("Missing chat evidence never creates a contact, changes an old candidate or issues input", async () =>
 {
     var contacts = ContactRepository(); var old = new Contact { DisplayName = "测试联系人", AddressTerm = "旧候选" }; contacts.SaveContact(old);
-    var adapter = new FakeAdapter { IsDemo = false };
+    var adapter = new FakeAdapter();
     var model = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", AddressTerm = "测试联系人", GreetingText = "测试联系人，生日快乐！" } };
-    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, null, default);
+    var result = await new TaskCoordinator(contacts, examples, protector).RunAsync(RealSettings(), adapter, model, default);
     Equal(2, model.Calls); Equal("失败", result!.GenerationStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
     Equal("旧候选", contacts.Contacts("default").Single().AddressTerm); Equal("unknown", contacts.Contacts("default").Single().AddressTermSource);
 });
@@ -958,19 +962,19 @@ await Test("User-entered and evidenced chat salutations remain reusable while un
 await Test("Screenshot recipient mismatch blocks append after successful generation", async () =>
 {
     var adapter = new FakeAdapter();
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel { ObservedName = "其他联系人" }, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel { ObservedName = "其他联系人" }, default);
     Equal("成功", result!.GenerationStatus); Equal(false, result.ScreenshotRecipientMatched); Equal(0, adapter.Appends);
 });
 await Test("Successful append records original length and verified preservation", async () =>
 {
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, new FakeAdapter(), new FakeModel { ObservedName = "测试联系人" }, null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, new FakeAdapter(), new FakeModel { ObservedName = "测试联系人" }, default);
     Equal(8, result!.OriginalCharacters); Equal(true, result.OriginalPreserved); Equal(true, result.ScreenshotRecipientMatched);
 });
 await Test("Missing screenshot title blocks real-mode append", async () =>
 {
     var adapter = new FakeAdapter();
-    var realSettings = new AppSettings { Scene = "生日", DemoMode = false, BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", ProtectedApiKey = protector.Protect("test-key") };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(realSettings, adapter, new FakeModel(), null, default);
+    var realSettings = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example", ProtectedApiKey = protector.Protect("test-key") };
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(realSettings, adapter, new FakeModel { ObservedName = null }, default);
     Equal("成功", result!.GenerationStatus); Equal(0, adapter.Appends); Equal(null, result.AppendAttemptId);
 });
 await Test("Rate limit requires at least eight seconds cooldown", async () =>
@@ -998,9 +1002,9 @@ await Test("The selected scene guides the model without blocking or retrying a d
             };
         });
         using var client = new CompatibleModelClient(handler);
-        var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", CanCollectMoreContext = false };
+        var adapter = new FakeAdapter { TitleSource = "ocr", CanCollectMoreContext = false };
         var result = await new TaskCoordinator(repo, examples, protector).RunAsync(
-            RealSettings() with { Scene = "春节", ZodiacYear = "马年" }, adapter, client, null, default);
+            RealSettings() with { Scene = "春节", ZodiacYear = "马年" }, adapter, client, default);
         Equal(1, handler.Calls);
         Equal(1, result!.ApiCallCount);
         Equal(1, adapter.Appends);
@@ -1012,8 +1016,8 @@ await Test("Provider quota errors do not retry or expose error message secrets",
     var handler = new StubHandler(_ => new(HttpStatusCode.TooManyRequests) { Content = new StringContent("{\"error\":{\"code\":\"1308\",\"message\":\"secret-from-server\"}}") });
     using var client = new CompatibleModelClient(handler);
     var adapter = new FakeAdapter();
-    var realSettings = new AppSettings { Scene = "生日", DemoMode = false, BaseUrl = "https://open.bigmodel.cn/api/paas/v4", Model = "glm-4.6v-flash", AuthorizedOrigin = "https://open.bigmodel.cn", ProtectedApiKey = protector.Protect("test-key") };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(realSettings, adapter, client, null, default);
+    var realSettings = new AppSettings { Scene = "生日", BaseUrl = "https://open.bigmodel.cn/api/paas/v4", Model = "glm-4.6v-flash", AuthorizedOrigin = "https://open.bigmodel.cn", ProtectedApiKey = protector.Protect("test-key") };
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(realSettings, adapter, client, default);
     Equal(1, handler.Calls); Equal(0, adapter.Appends);
     True(result!.Error.Contains("1308") && !result.Error.Contains("secret-from-server"), "unsafe or missing error detail");
 });
@@ -1214,9 +1218,9 @@ await Test("Fallback only activates for unavailable UIA and records the selected
     var visual = new FakeAdapter { AutomationMethod = "vision", LayoutApiCallCount = 4, CanAutoAppend = false,
         AutoAppendUnavailableReason = "视觉生成不能复查 UIA 会话标识，未预填。" };
     using var adapter = new FallbackConversationAdapter(primary, () => visual);
-    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings with { DemoMode = false, EnableLiveAppend = true,
+    var result = await new TaskCoordinator(ContactRepository(), examples, protector).RunAsync(settings with { EnableLiveAppend = true,
         BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example" }, adapter,
-        new FakeModel { ObservedName = "测试联系人" }, null, default);
+        new FakeModel { ObservedName = "测试联系人" }, default);
     Equal("vision", result!.AutomationMethod); Equal("UIA absent", result.FallbackReason); Equal(4, result.LayoutApiCallCount); Equal(0, visual.Appends);
     Equal(null, result.AppendAttemptId); Equal(visual.AutoAppendUnavailableReason, result.Error);
 });
@@ -1238,7 +1242,7 @@ await Test("An uncertain primary write never falls back to a second adapter", as
     var factories = 0; var primary = new FakeAdapter { Result = new("预填结果待确认", "uncertain") };
     using var adapter = new FallbackConversationAdapter(primary, () => { factories++; return new FakeAdapter(); });
     await adapter.BeginAsync(default);
-    var result = await adapter.AppendAsync(new("s", "联系人", "", "w", true), "祝福", default);
+    var result = await adapter.AppendAsync(new("s", "联系人", "", "w"), "祝福", default);
     Equal("预填结果待确认", result.Status); Equal(1, primary.Appends); Equal(0, factories);
 });
 await Test("Full-window vision authorization is separate and bound to the destination", async () =>
@@ -1301,7 +1305,7 @@ await Test("Layout requests include local anchors while keeping model safety che
 await Test("Clipboard cleanup warnings remain visible without replaying input", async () =>
 {
     var adapter = new FakeAdapter { CleanupWarning = "原剪贴板未能恢复" };
-    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), null, default);
+    var result = await new TaskCoordinator(repo, examples, protector).RunAsync(settings, adapter, new FakeModel(), default);
     Equal(1, adapter.Appends); True(result!.Error.Contains("原剪贴板未能恢复"), "cleanup warning lost");
 });
 foreach (var (name, run) in ClipboardChecks.Cases())
@@ -1332,9 +1336,9 @@ sealed class FakeAdapter : IConversationAdapter
     public string AutoAppendUnavailableReason { get; init; } = "";
     public string StateChangeReason { get; set; } = "";
     public Func<CancellationToken, Task<bool>>? WaitForAppend { get; set; }
-    public bool IsDemo { get; init; } = true;
     public bool OriginalTextRead { get; init; } = true;
     public bool DirectAppend { get; init; }
+    public bool ForceGeneration { get; init; }
     public bool DisplayNameRead { get; init; } = true;
     public string DisplayName { get; init; } = "测试联系人";
     public string TitleSource { get; init; } = "uia";
@@ -1351,8 +1355,9 @@ sealed class FakeAdapter : IConversationAdapter
         OnBegin?.Invoke();
         if (BeginError is not null) throw BeginError;
         if (BeginDelayMs > 0) await Task.Delay(BeginDelayMs, ct);
-        return new ConversationSnapshot("session", DisplayName, OriginalTextRead ? "original" : "", "window", IsDemo,
-            OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource) { DirectAppend = DirectAppend };
+        return new ConversationSnapshot("session", DisplayName, OriginalTextRead ? "original" : "", "window",
+            OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource)
+            { DirectAppend = DirectAppend, ForceGeneration = ForceGeneration };
     }
     public Task<Capture> CaptureAsync(ConversationSnapshot s, int index, CancellationToken ct) => Task.FromResult(new Capture("capture_" + index, [RepeatCapture ? (byte)0 : (byte)index], RequiresConversationCheck, TitleSource == "ocr" ? DisplayName : null));
     public Task<bool> ScrollUpAsync(ConversationSnapshot s, CancellationToken ct) { Scrolls++; return Task.FromResult(true); }
@@ -1364,7 +1369,7 @@ sealed class FakeAdapter : IConversationAdapter
 sealed class FakeModel : IGreetingModel
 {
     public int Calls; public bool NeedsMore; public bool Invalid; public int DelayMs;
-    public string? ObservedName;
+    public string? ObservedName = "测试联系人";
     public Contact? LastContact;
     public AppSettings? LastSettings;
     public IReadOnlyList<BlessingExample> LastExamples = [];

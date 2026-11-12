@@ -9,7 +9,7 @@ internal static class OcrPrefillChecks
     public static IEnumerable<(string Name, Func<Task> Run)> Cases(string root, ExampleService examples, ISecretProtector protector)
     {
         LocalRepository Repository() => new(Path.Combine(root, "ocr-" + Guid.NewGuid().ToString("N")), protector);
-        var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+        var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
             AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
         yield return ("Plain-text copy rejects embedded image objects carried alongside Unicode text", () =>
         {
@@ -65,33 +65,33 @@ internal static class OcrPrefillChecks
         });
         yield return ("OCR supplies title to generation and permits one checked append without a model title", async () =>
         {
-            var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", RequiresConversationCheck = true };
-            var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter, new FakeModel(), null, default);
+            var adapter = new FakeAdapter { TitleSource = "ocr", RequiresConversationCheck = true };
+            var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter, new FakeModel(), default);
             if (result!.GenerationStatus != "成功" || result.FillStatus != "已预填" || adapter.Appends != 1 ||
                 result.ObservedDisplayName != adapter.DisplayName || result.ScreenshotRecipientMatched != true || result.LayoutApiCallCount != 0)
                 throw new Exception("Model title remained mandatory or the checked OCR append failed.");
         });
         yield return ("A model cannot override the locally read OCR title or reject it with a conflicting name", async () =>
         {
-            var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", RequiresConversationCheck = true };
+            var adapter = new FakeAdapter { TitleSource = "ocr", RequiresConversationCheck = true };
             var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter,
-                new FakeModel { ObservedName = "其他名字(999)" }, null, default);
+                new FakeModel { ObservedName = "其他名字(999)" }, default);
             if (result!.FillStatus != "已预填" || result.ObservedDisplayName != adapter.DisplayName || adapter.Appends != 1)
                 throw new Exception("Untrusted model title replaced local OCR evidence.");
         });
         yield return ("Changed OCR state preserves generated text and does not create a paste intent", async () =>
         {
-            var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", RequiresConversationCheck = true };
+            var adapter = new FakeAdapter { TitleSource = "ocr", RequiresConversationCheck = true };
             var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter,
-                new FakeModel { BeforeReturn = () => adapter.Valid = false }, null, default);
+                new FakeModel { BeforeReturn = () => adapter.Valid = false }, default);
             if (result!.GenerationStatus != "成功" || string.IsNullOrEmpty(result.Greeting) || adapter.Appends != 0 || result.AppendAttemptId is not null)
                 throw new Exception("Changed title/draft wrote text or lost the generated candidate.");
         });
         yield return ("Unread OCR-mode draft remains read-only even when prefill is selected", async () =>
         {
-            var adapter = new FakeAdapter { IsDemo = false, TitleSource = "ocr", OriginalTextRead = false, CanAutoAppend = false,
+            var adapter = new FakeAdapter { TitleSource = "ocr", OriginalTextRead = false, CanAutoAppend = false,
                 RequiresConversationCheck = true };
-            var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter, new FakeModel(), null, default);
+            var result = await new TaskCoordinator(Repository(), examples, protector).RunAsync(configuration, adapter, new FakeModel(), default);
             if (result!.GenerationStatus != "成功" || adapter.Appends != 0 || result.FillStatus != "待手动处理")
                 throw new Exception("An unread draft was promoted to a write.");
         });

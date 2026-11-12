@@ -32,10 +32,10 @@ public sealed partial class MainWindow
         {
             cards.Children.Clear();
             foreach (var contact in _repository.Contacts(_settings.AccountScope).Where(x =>
-                (x.DisplayName + "\n" + x.RemarkName).Contains(search.Text, StringComparison.OrdinalIgnoreCase)))
+                !x.IsDemo && (x.DisplayName + "\n" + x.RemarkName).Contains(search.Text, StringComparison.OrdinalIgnoreCase)))
             {
                 var card = Ui.Stack(12, Ui.Row(10, Ui.Text(contact.DisplayName, 18, bold: true), Ui.Badge(contact.Confirmed ? "信息已确认" : "模型候选"),
-                    Ui.Badge(contact.IsDemo ? "演示" : "按备注匹配", "8D794E", "F5F0E4")),
+                    Ui.Badge("按备注匹配", "8D794E", "F5F0E4")),
                     Ui.Text($"匹配备注：{(string.IsNullOrWhiteSpace(contact.RemarkName) ? contact.DisplayName : contact.RemarkName)}", 12, "7C8B81"),
                     Ui.Text($"关系：{RelationshipLabel(contact.Relationship)}  ·  称呼：{contact.AddressTerm ?? "未知"}  ·  身份：{contact.IdentityLabel ?? "未知"}", 14, "738278"),
                     Ui.Text("称呼来源：" + AddressSourceLabel(contact.Confirmed ? "user" : contact.AddressTermSource), 12, "7C8B81"),
@@ -77,7 +77,7 @@ public sealed partial class MainWindow
             contact.AddressEvidence = null;
         }
         contact.AddressTerm = editedAddress; contact.IdentityLabel = NullIfEmpty(identity.Text); contact.Confirmed = confirmed.IsChecked == true;
-        _repository.SaveContact(contact); SeedDemoContacts(); ShowContacts();
+        _repository.SaveContact(contact); ShowContacts();
     }
 
     internal static string AddressSourceLabel(string source) => source switch
@@ -145,7 +145,7 @@ public sealed partial class MainWindow
                 _settings = candidate;
                 UpdateHotkeyFooter();
                 StopSentRecording("设置已更新，请为目标聊天重新开启发送归档。");
-                _repository.Cleanup(candidate.RetentionDays); SeedDemoContacts();
+                _repository.Cleanup(candidate.RetentionDays);
                 ShowSettings("设置已保存。模型 API 的连接与授权在「API 管理」页面维护。");
             }
             catch (Exception e) { Feedback(e.Message, false); }

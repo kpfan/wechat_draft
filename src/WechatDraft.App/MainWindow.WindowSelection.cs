@@ -33,7 +33,7 @@ public sealed partial class MainWindow
 
     private void RefreshWindows()
     {
-        if (_windows is null || !_homeVisible || _settings.DemoMode || _windowClosing ||
+        if (_windows is null || !_homeVisible || _windowClosing ||
             _coordinator.IsRunning || _runCancellation is not null || _windows.IsDropDownOpen) return;
         try
         {

@@ -68,36 +68,82 @@ internal static class LocalVisionChecks
             var repo = new LocalRepository(Path.Combine(root, "emoji-" + Guid.NewGuid().ToString("N")), protector);
             const string title = "测试好友🎀-研发部";
             repo.SaveContact(new Contact { DisplayName = title, RemarkName = title, Confirmed = true, AddressTerm = "陈老师", AddressTermSource = "user" });
-            var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                 AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-            var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             var model = new FakeModel { Response = new() { ObservedDisplayName = title, ConversationType = "single",
                 GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "成功" || result.DisplayName != title || result.ScreenshotRecipientMatched is not null ||
                 result.ContactId is not null || result.ContactReused || model.LastContact is not null || adapter.Appends != 0 || result.AppendAttemptId is not null)
                 throw new Exception("A model-read title was blocked by OCR or treated as independent identity.");
             if (repo.Contacts("default").Count != 1 || repo.Contacts("default")[0].AddressTerm != "陈老师")
                 throw new Exception("Read-only visual analysis mutated a saved contact.");
-            adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             model.Response = model.Response with { ConversationType = "unknown" };
-            result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "成功" || model.Calls != 2 || adapter.Appends != 0 || repo.Contacts("default").Count != 1)
                 throw new Exception("A model type blocked a title without a group suffix, or granted write access.");
         });
         yield return ("An adapter cannot authorize input from a snapshot without an independently read title", async () =>
         {
             var repo = new LocalRepository(Path.Combine(root, "title-" + Guid.NewGuid().ToString("N")), protector);
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
+                AuthorizedOrigin = "https://test.example", EnableLiveAppend = true };
             foreach (var originalRead in new[] { false, true })
             {
                 var adapter = new FakeAdapter { CanAutoAppend = true, DisplayNameRead = false, OriginalTextRead = originalRead };
                 var model = new FakeModel();
-                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(new AppSettings { DemoMode = true, Scene = "生日" }, adapter, model, null, default);
-                if (result!.GenerationStatus != "失败" || model.Calls != 0 || adapter.Appends != 0)
+                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
+                if (result!.GenerationStatus != "失败" || !result.Error.Contains("独立读取聊天标题") ||
+                    model.Calls != 0 || adapter.Appends != 0)
                     throw new Exception("A missing independent title granted write capability.");
             }
+        });
+        yield return ("Explicit force generation collects the same context without titles and appends only when ready", async () =>
+        {
+            var repo = new LocalRepository(Path.Combine(root, "force-" + Guid.NewGuid().ToString("N")), protector);
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
+                AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = false };
+            var response = JsonSerializer.Serialize(new ModelResponse { GreetingText = "生日快乐，愿你新的一岁平安顺心！" });
+            var expectedCaptures = 0;
+            var handler = new StubHandler(request =>
+            {
+                using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+                var content = json.RootElement.GetProperty("messages")[1].GetProperty("content");
+                using var instruction = JsonDocument.Parse(content[0].GetProperty("text").GetString()!);
+                var images = content.EnumerateArray().Where(item => item.GetProperty("type").GetString() == "image_url")
+                    .Select(item => item.GetProperty("image_url").GetProperty("url").GetString());
+                var expectedImages = Enumerable.Range(0, expectedCaptures)
+                    .Select(index => "data:image/png;base64," + Convert.ToBase64String([(byte)index]));
+                if (!instruction.RootElement.GetProperty("skip_title_check").GetBoolean() ||
+                    instruction.RootElement.GetProperty("check_title_group_suffix").GetBoolean() ||
+                    instruction.RootElement.GetProperty("recipient_checked_locally").GetBoolean() ||
+                    !images.SequenceEqual(expectedImages))
+                    throw new Exception("Forced generation requested a title check or sent unexpected context.");
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new
+                    { choices = new[] { new { message = new { content = response } } } })) };
+            });
+            using var model = new CompatibleModelClient(handler);
+            var coordinator = new TaskCoordinator(repo, examples, protector);
+            foreach (var (ready, canScroll) in new[] { (true, true), (false, true), (true, false) })
+            {
+                expectedCaptures = canScroll ? 3 : 1;
+                var adapter = new FakeAdapter { AutomationMethod = "vision", TitleSource = "none",
+                    DisplayNameRead = false, DisplayName = "", OriginalTextRead = false, DirectAppend = true,
+                    ForceGeneration = true, CanCollectMoreContext = canScroll, WaitForAppend = _ => Task.FromResult(ready) };
+                var task = await coordinator.RunAsync(configuration, adapter, model, default);
+                if (task is null || task.GenerationStatus != "成功" || task.DisplayName != "强制生成" ||
+                    task.ObservedDisplayName is not null || task.ContactId is not null || task.ScreenshotRecipientMatched is not null ||
+                    task.CaptureCount != expectedCaptures || adapter.Scrolls != expectedCaptures - 1 ||
+                    adapter.Appends != (ready ? 1 : 0) ||
+                    (task.AppendAttemptId is not null) != ready)
+                    throw new Exception("Forced generation wrote without readiness, required a title, or claimed a verified contact.");
+            }
+            if (handler.Calls != 3 || repo.Contacts(configuration.AccountScope).Count != 0)
+                throw new Exception("Forced generation retried or changed contact records.");
         });
         yield return ("Local OCR reconstructs CJK spacing without deleting real spaces in titles", () =>
         {
@@ -113,13 +159,13 @@ internal static class LocalVisionChecks
             foreach (var type in new[] { "single", "unknown", "group", "service" })
             {
                 var repo = new LocalRepository(Path.Combine(root, "local-" + Guid.NewGuid().ToString("N")), protector);
-                var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+                var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                     AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-                var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+                var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                     DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false, RequiresConversationCheck = true };
                 var model = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", ConversationType = type,
                     GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
                 if (result!.GenerationStatus != "成功" || model.Calls != 1 || adapter.Appends != 0 ||
                     adapter.Scrolls != 0 || result.AppendAttemptId is not null || result.LayoutApiCallCount != 0 || result.ScreenshotRecipientMatched is not null)
                     throw new Exception("Local visual semantics or read-only permissions were bypassed.");
@@ -145,7 +191,7 @@ internal static class LocalVisionChecks
                 if (layout.ConversationType != "unknown" || layout.DraftKind != "unknown" || !layout.Uncertain)
                     throw new Exception("Geometry is not semantic proof.");
                 MustReject(() => VisionRules.Validate(layout));
-                var result = await adapter.AppendAsync(new("s", "n", "draft", "w", false), "祝福", default);
+                var result = await adapter.AppendAsync(new("s", "n", "draft", "w"), "祝福", default);
                 if (result.Status != "待手动处理") throw new Exception("A visual result authorized a write.");
             }
         });
@@ -413,11 +459,11 @@ internal static class LocalVisionChecks
             foreach (var source in new[] { "ocr", "uia" })
             {
                 var repository = new LocalRepository(Path.Combine(root, "group-preflight-" + Guid.NewGuid().ToString("N")), protector);
-                var adapter = new FakeAdapter { IsDemo = false, DisplayName = "测试群 （1 12）", TitleSource = source };
+                var adapter = new FakeAdapter { DisplayName = "测试群 （1 12）", TitleSource = source };
                 var model = new FakeModel();
-                var configuration = new AppSettings { DemoMode = false, Model = "fake", Scene = "生日", EnableLiveAppend = true,
+                var configuration = new AppSettings { Model = "fake", Scene = "生日", EnableLiveAppend = true,
                     BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example" };
-                var result = await new TaskCoordinator(repository, examples, protector).RunAsync(configuration, adapter, model, null, default);
+                var result = await new TaskCoordinator(repository, examples, protector).RunAsync(configuration, adapter, model, default);
                 if (model.Calls != 0 || result!.ApiCallCount != 0 || result.GenerationStatus != "失败" || result.Greeting.Length != 0 ||
                     adapter.Appends != 0 || result.AppendAttemptId is not null || repository.Contacts("default").Count != 0 || !result.Error.Contains("群聊"))
                     throw new Exception("Group title reached generation or input before validation.");
@@ -426,13 +472,13 @@ internal static class LocalVisionChecks
         yield return ("Detected group-title counts stop once without retrying or saving a contact", async () =>
         {
             var repo = new LocalRepository(Path.Combine(root, "suffix-" + Guid.NewGuid().ToString("N")), protector);
-            var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                 AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-            var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             var model = new FakeModel { Response = new() { ObservedDisplayName = "测试群(242)", ConversationType = "single",
                 GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "失败" || !result.Error.Contains("括号人数大于 2") || model.Calls != 1 ||
                 adapter.Appends != 0 || result.AppendAttemptId is not null || repo.Contacts("default").Count != 0)
                 throw new Exception("Group suffix retried, created a contact, or granted write access.");

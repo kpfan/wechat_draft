@@ -10,7 +10,7 @@ internal static class ApiProfileChecks
             ApiProfileName = profileName,
             BaseUrl = "https://first.example/v1", Model = "first-vision", ProtectedApiKey = "encrypted-first",
             AuthorizedOrigin = "https://first.example", VisionAuthorizedOrigin = "https://first.example",
-            AccountScope = "existing-account", ExtraInstruction = "保留补充要求", DemoMode = false,
+            AccountScope = "existing-account", ExtraInstruction = "保留补充要求",
             WindowLayout = new() { WidthDip = 1000, HeightDip = 800 }
         });
         AppSettings AddSecond(AppSettings first) => ApiProfileSettings.Save(first with
@@ -42,7 +42,7 @@ internal static class ApiProfileChecks
             Equal(first.VisionAuthorizedOrigin, restored.VisionAuthorizedOrigin);
             Equal(false, restored.AllowLoopbackHttp);
             Equal(first.AccountScope, restored.AccountScope); Equal(first.ExtraInstruction, restored.ExtraInstruction);
-            Equal(first.DemoMode, restored.DemoMode); Equal(first.WindowLayout, restored.WindowLayout);
+            Equal(first.WindowLayout, restored.WindowLayout);
             return Task.CompletedTask;
         });
         yield return ("First-use screenshot consent works for a migrated default and stays with the confirmed API", () =>

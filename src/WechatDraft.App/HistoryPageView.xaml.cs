@@ -75,7 +75,7 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
     {
         _initialized = false;
         SearchBox.Text = ContactBox.Text = SceneBox.Text = "";
-        StatusBox.SelectedIndex = ModeBox.SelectedIndex = 0;
+        StatusBox.SelectedIndex = 0;
         FromPicker.Date = ToPicker.Date = null;
         _initialized = true;
         _ = RefreshAsync(false);
@@ -85,7 +85,7 @@ public sealed partial class HistoryPageView : UserControl, IDisposable
     {
         Keyword = SearchBox.Text.Trim(), Contact = ContactBox.Text.Trim(), Scene = SceneBox.Text.Trim(),
         FillStatus = StatusBox.SelectedIndex > 0 ? (string)StatusBox.SelectedItem : "",
-        IsDemo = ModeBox.SelectedIndex switch { 1 => false, 2 => true, _ => null },
+        IsDemo = false,
         FromDate = FromPicker.Date is { } from ? DateOnly.FromDateTime(from.DateTime) : null,
         ToDate = ToPicker.Date is { } to ? DateOnly.FromDateTime(to.DateTime) : null
     };

@@ -11,7 +11,7 @@ using WechatDraft.Core;
 namespace WechatDraft.Windows;
 
 public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progress = null, bool enableAppend = false,
-    nint clipboardOwner = 0, nint companion = 0, IChatTitleOcr? titleOcr = null) : IConversationAdapter, IDisposable
+    nint clipboardOwner = 0, nint companion = 0, IChatTitleOcr? titleOcr = null, bool forceGeneration = false) : IConversationAdapter, IDisposable
 {
     private readonly IChatTitleOcr _ocr = new ExactTitleOcrCache(titleOcr ?? WechatLocalTitleReader.Default);
     private Native.Rect _bounds;
@@ -106,7 +106,8 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     public async Task<ConversationSnapshot> BeginAsync(CancellationToken ct)
     {
         _debug = DebugSession.Current;
-        await CheckLayoutAsync(ct); await ReadLocalTitleAsync(ct);
+        await CheckLayoutAsync(ct);
+        if (!forceGeneration) await ReadLocalTitleAsync(ct);
         Native.GetWindowThreadProcessId(companion, out var ownerPid);
         _companion = companion != 0 && ownerPid == Environment.ProcessId ? companion : 0;
         try
@@ -114,12 +115,13 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
             _monitor = new VisionInputMonitor(target, stopOnWheel: false, stopOnClick: false, stopOnKeyboard: false,
                 companion: _companion, trackWheelActivity: false);
             if (!enableAppend) return CreateReadonlySnapshot(ct);
-            if (Debug is { Enabled: true } debug)
+            if (!forceGeneration && Debug is { Enabled: true } debug)
             {
                 using var image = _frozenContext!.CopyImage();
                 _inputChanges = new(CaptureInput(image, true), _frame!.Dpi, debug);
             }
-            _guard = new(_layout!.Title);
+            _guard = forceGeneration ? OcrPrefillGuard.WithoutTitleCheck() : new(_layout!.Title);
+            if (forceGeneration) return CreateReadonlySnapshot(ct) with { DirectAppend = true };
             _watch = new System.Windows.Forms.Timer { Interval = 400 };
             _watch.Tick += async (_, _) => await ObserveAsync(ct);
             _watch.Start();
@@ -139,8 +141,9 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         ct.ThrowIfCancellationRequested();
         if (_frame is null || _layout is null || _frozenContext is null) throw new InvalidOperationException("本地视觉区域尚未准备。");
         var titleRead = !string.IsNullOrWhiteSpace(_layout.Title);
-        return new(Guid.NewGuid().ToString("N"), _layout.Title, "", _identity, false, this,
-            OriginalTextRead: false, DisplayNameRead: titleRead, TitleSource: titleRead ? "ocr" : "model");
+        return new(Guid.NewGuid().ToString("N"), _layout.Title, "", _identity, this,
+            OriginalTextRead: false, DisplayNameRead: titleRead, TitleSource: titleRead ? "ocr" : forceGeneration ? "none" : "model")
+            { ForceGeneration = forceGeneration };
     }
 
     private string Identity()
@@ -242,6 +245,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     {
         EnsureWindow(ct);
         if (_guard is { Valid: false }) return false;
+        if (forceGeneration) return true;
         using var current = Screenshot(ct);
         if (!await CheckTitleAsync(current, ct)) return false;
         // A timer that was awaiting OCR must not observe our own copy/paste in progress.
@@ -251,6 +255,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     }
     private async Task<bool> CheckTitleAsync(Bitmap image, CancellationToken ct)
     {
+        if (forceGeneration) return _guard?.Valid != false;
         var title = await ReadTitleAsync(image, ct);
         EnsureWindow(ct);
         if (_guard is not null ? !_guard.CheckTitle(title) : title != _layout!.Title)
@@ -264,9 +269,8 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         VisionInputSettler.WaitAsync(async token =>
         {
             using var image = Screenshot(token);
-            var title = await ReadTitleAsync(image, token);
+            if (!await CheckTitleAsync(image, token)) throw new InvalidOperationException(StateChangeReason);
             CheckActivity(version, token);
-            if (_guard is null || !_guard.CheckTitle(title)) throw new InvalidOperationException(StateChangeReason);
             return CaptureInput(image, true);
         }, () => CheckActivity(version, ct), _frame!.Dpi, ct, changedFrom);
     private async Task ObserveAsync(CancellationToken ct)
@@ -343,8 +347,11 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
             clickMs = Stopwatch.GetElapsedTime(clickStarted, shortcutsStarted).TotalMilliseconds,
             shortcutsMs = Stopwatch.GetElapsedTime(shortcutsStarted, pollStarted).TotalMilliseconds,
             read.Attempts, read.ElapsedMs, maxCopyWaitMs = 150 });
-        using var image = Screenshot(ct);
-        if (!await CheckTitleAsync(image, ct)) throw new InvalidOperationException(StateChangeReason);
+        if (!forceGeneration)
+        {
+            using var image = Screenshot(ct);
+            if (!await CheckTitleAsync(image, ct)) throw new InvalidOperationException(StateChangeReason);
+        }
         CheckActivity(version, ct);
         return read;
     }
@@ -356,7 +363,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         var context = index == 0 ? await CaptureMessagePageAsync(snapshot, firstPage: true, ct) ??
             _frozenContext.Capture(_frame!, _layout!, index)
             : _scrolledContext ?? throw new InvalidOperationException("未取得上滚后的消息区。");
-        var capture = context with { Id = $"vision_context_{index}", RequiresConversationCheck = true,
+        var capture = context with { Id = $"vision_context_{index}", RequiresConversationCheck = !forceGeneration,
             LocalTitle = string.IsNullOrWhiteSpace(_layout!.Title) ? null : _layout.Title };
         if (DebugSession.Current is { Enabled: true } debug) debug.WriteBytes("greeting_context_" + index, capture.PngBytes, ".png");
         return capture;
@@ -377,7 +384,6 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     public async Task<bool> WaitForAppendReadyAsync(ConversationSnapshot snapshot, CancellationToken ct)
     {
         if (snapshot.NativeState != this || _guard is null) return false;
-        // The coordinator checks the live title as soon as the target is back in front.
         var result = await UiaForegroundWaiter.WaitAsync(() => Native.GetForegroundWindow() == target,
             _ =>
             {
@@ -385,7 +391,8 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
                 var foreground = Native.GetForegroundWindow();
                 return Task.FromResult(!_disposed && _guard.Valid &&
                     (foreground == target || foreground == _companion && _companion != 0));
-            }, () => Report("等待返回微信", "请回到原微信聊天，核对标题后追加到当前草稿", 87), ct);
+            }, () => Report("等待返回微信", forceGeneration ? "请回到所选微信窗口，祝福会追加到当前草稿"
+                : "请回到原微信聊天，核对标题后追加到当前草稿", 87), ct);
         return result == ForegroundWaitResult.Ready || Reject(result == ForegroundWaitResult.TimedOut ? "等待返回微信超时，请复制正文。" : StateChangeReason);
     }
     public async Task<bool> ScrollUpAsync(ConversationSnapshot snapshot, CancellationToken ct)
@@ -408,7 +415,8 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         var ready = await UiaForegroundWaiter.WaitAsync(() => Native.GetForegroundWindow() == target,
             _ => Task.FromResult(CanContinue() &&
                 VisionInteractionState.IsAllowedForeground(Native.GetForegroundWindow(), target, _companion)),
-            () => Report("等待返回微信", "请在 10 秒内回到原聊天，继续采集消息", 25), ct,
+            () => Report("等待返回微信", forceGeneration ? "请在 10 秒内回到所选微信窗口，继续采集消息"
+                : "请在 10 秒内回到原聊天，继续采集消息", 25), ct,
             timeout: TimeSpan.FromSeconds(10));
         if (ready != ForegroundWaitResult.Ready)
             return Stop(ready == ForegroundWaitResult.TimedOut ? "wechat-foreground-timeout" :
@@ -503,7 +511,8 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         _ioDepth++;
         try
         {
-            if (snapshot.NativeState != this || !enableAppend || _guard is null || !snapshot.DirectAppend || snapshot.TitleSource != "ocr")
+            if (snapshot.NativeState != this || !enableAppend || _guard is null || !snapshot.DirectAppend ||
+                snapshot.ForceGeneration != forceGeneration || (!forceGeneration && snapshot.TitleSource != "ocr"))
                 return new("待手动处理", AutoAppendUnavailableReason);
             if (_guard.WriteIssued) return new("预填结果待确认", "本次已尝试填写，未重复写入。");
             if (!_guard.Valid) return new("待手动处理", StateChangeReason);
@@ -559,14 +568,14 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
                 return new("预填结果待确认", "已通过键盘尝试追加祝福，原剪贴板已保留。请检查微信草稿。");
             }
             Native.VisionChord(0x56);
-            DebugSession.Current?.Event("visual_paste_issued", new { characters = greeting.Length, ocrEngine = _ocr.Name,
+            DebugSession.Current?.Event("visual_paste_issued", new { characters = greeting.Length, ocrEngine = forceGeneration ? null : _ocr.Name,
                 readbackWait = "input-changed-and-stable" });
             CheckActivity(version, ct);
             // Keep the paste payload on the clipboard until WeChat replaces it with a fresh copy.
             await WaitForInputSettledAsync(version, ct, beforePaste);
             var actual = await ReadDraftAsync(clipboard!, version, ct);
             return actual.ConfirmsSuffix(greeting)
-                ? new("已预填", "OCR 标题一致，已读回文末祝福。请检查后手动发送。")
+                ? new("已预填", forceGeneration ? "已读回文末祝福。请检查后手动发送。" : "OCR 标题一致，已读回文末祝福。请检查后手动发送。")
                 : new("预填结果待确认", "未能确认文末祝福，请检查微信；未重复写入。");
         }
         catch (Exception e) when (e is not OperationCanceledException)

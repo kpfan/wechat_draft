@@ -23,15 +23,12 @@
                 <TextBox x:Name="SceneBox" Grid.Column="2" Header="场景" PlaceholderText="如：生日、春节" TextChanged="SearchChanged"/>
             </Grid>
             <Grid ColumnSpacing="10">
-                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+                <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
                 <ComboBox x:Name="StatusBox" Header="预填状态" SelectedIndex="0" HorizontalAlignment="Stretch" SelectionChanged="FilterChanged">
-                    <x:String>全部状态</x:String><x:String>已预填</x:String><x:String>演示预填</x:String><x:String>待手动处理</x:String><x:String>未预填</x:String><x:String>预填结果待确认</x:String><x:String>写入中</x:String><x:String>未尝试</x:String><x:String>中断</x:String>
+                    <x:String>全部状态</x:String><x:String>已预填</x:String><x:String>待手动处理</x:String><x:String>未预填</x:String><x:String>预填结果待确认</x:String><x:String>写入中</x:String><x:String>未尝试</x:String><x:String>中断</x:String>
                 </ComboBox>
-                <ComboBox x:Name="ModeBox" Grid.Column="1" Header="任务模式" SelectedIndex="0" HorizontalAlignment="Stretch" SelectionChanged="FilterChanged">
-                    <x:String>全部模式</x:String><x:String>真实模式</x:String><x:String>演示模式</x:String>
-                </ComboBox>
-                <CalendarDatePicker x:Name="FromPicker" Grid.Column="2" Header="开始日期" PlaceholderText="不限" HorizontalAlignment="Stretch" DateChanged="DateFilterChanged"/>
-                <CalendarDatePicker x:Name="ToPicker" Grid.Column="3" Header="结束日期" PlaceholderText="不限" HorizontalAlignment="Stretch" DateChanged="DateFilterChanged"/>
+                <CalendarDatePicker x:Name="FromPicker" Grid.Column="1" Header="开始日期" PlaceholderText="不限" HorizontalAlignment="Stretch" DateChanged="DateFilterChanged"/>
+                <CalendarDatePicker x:Name="ToPicker" Grid.Column="2" Header="结束日期" PlaceholderText="不限" HorizontalAlignment="Stretch" DateChanged="DateFilterChanged"/>
             </Grid>
             <StackPanel Orientation="Horizontal" Spacing="8">
                 <Button Content="重置筛选" Padding="12,8" Click="ResetClicked"/>

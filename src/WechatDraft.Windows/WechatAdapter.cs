@@ -192,7 +192,7 @@ public sealed class WechatAdapter(nint target, bool enableAppend, nint assistant
             _scrollHandler = (_, _) => { if (!_programmaticScroll) _userScrolled = true; };
             Automation.AddAutomationPropertyChangedEventHandler(state.ScrollElement, TreeScope.Element, _scrollHandler, ScrollPattern.VerticalScrollPercentProperty);
         }
-        return new(Guid.NewGuid().ToString("N"), state.HeaderName, original, state.ProcessIdentity, false, state);
+        return new(Guid.NewGuid().ToString("N"), state.HeaderName, original, state.ProcessIdentity, state);
     }
 
     private static async Task<State> InspectAsync(nint hwnd, CancellationToken cancellationToken)

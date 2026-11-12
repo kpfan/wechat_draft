@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
@@ -23,6 +24,18 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern bool ClientToScreen(nint hwnd, ref Point point);
     [DllImport("user32.dll")] internal static extern bool IsClipboardFormatAvailable(uint format);
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(nint hwnd, StringBuilder text, int capacity);
+
+    internal static object DescribeWindow(nint hwnd)
+    {
+        GetWindowThreadProcessId(hwnd, out var pid);
+        var name = "";
+        try { using var process = Process.GetProcessById((int)pid); name = process.ProcessName; } catch { }
+        var className = new StringBuilder(256);
+        GetClassName(hwnd, className, className.Capacity);
+        return new { handle = hwnd.ToInt64(), processId = pid, processName = name, className = className.ToString(),
+            owner = GetAncestor(hwnd, 3).ToInt64() };
+    }
 
     internal static INPUT[] PrepareUnicodeInput(string text)
     {
@@ -138,7 +151,7 @@ internal sealed class VisionInputMonitor : IDisposable
             var actual = Native.GetForegroundWindow(); var changed = _state.Changed;
             _state.Foreground(hwnd, actual, target, companion);
             if (!changed && _state.Changed && _state.Reason == "foreground-change" && debug is { Enabled: true })
-                debug.Event("visual-foreground-change", new { reported = DescribeWindow(hwnd), actual = DescribeWindow(actual),
+                debug.Event("visual-foreground-change", new { reported = Native.DescribeWindow(hwnd), actual = Native.DescribeWindow(actual),
                     target = target.ToInt64(), companion = companion.ToInt64() });
         };
         var module = Native.GetModuleHandle(null);
@@ -147,12 +160,6 @@ internal sealed class VisionInputMonitor : IDisposable
         _foregroundHook = Native.SetWinEventHook(3, 3, 0, _foreground, 0, 0, 0);
         if (_keyboardHook == 0 || _mouseHook == 0 || _foregroundHook == 0)
         { Dispose(); throw new InvalidOperationException("无法监测用户操作，已停止预填。"); }
-    }
-    private static object DescribeWindow(nint hwnd)
-    {
-        Native.GetWindowThreadProcessId(hwnd, out var pid); var name = "";
-        try { using var process = Process.GetProcessById((int)pid); name = process.ProcessName; } catch { }
-        return new { handle = hwnd.ToInt64(), processId = pid, processName = name, owner = Native.GetAncestor(hwnd, 3).ToInt64() };
     }
     public void Dispose()
     {

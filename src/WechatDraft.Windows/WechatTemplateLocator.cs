@@ -13,6 +13,8 @@ using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
 
+internal enum WechatToolbarTheme { Light, Dark }
+
 // v0 reference: match only the selected window crop. Results stay window-relative until an action.
 internal static class WechatTemplateLocator
 {
@@ -25,7 +27,11 @@ internal static class WechatTemplateLocator
     private readonly record struct Sample(int Offset, double Centered);
     private sealed record TemplateSamples(int Width, int Height, Sample[] Samples, double Energy);
 
-    internal static VisionAnchorHints? Locate(Bitmap screenshot, uint dpi, CancellationToken ct)
+    internal static VisionAnchorHints? Locate(Bitmap screenshot, uint dpi, CancellationToken ct) =>
+        Locate(screenshot, dpi, ct, WechatToolbarTheme.Dark, _ => true)?.Anchors;
+
+    internal static (VisionAnchorHints Anchors, WechatToolbarTheme Theme)? Locate(
+        Bitmap screenshot, uint dpi, CancellationToken ct, WechatToolbarTheme preferred, Func<VisionAnchorHints, bool> accept)
     {
         ct.ThrowIfCancellationRequested();
         if (dpi is < 96 or > 384 || screenshot.Width < 400 || screenshot.Height < 350 ||
@@ -33,34 +39,45 @@ internal static class WechatTemplateLocator
         var budget = new SearchBudget(ct);
         try
         {
-            var scale = dpi / 192d;
-            using var top = LoadTemplate("wechat_top_template.png", scale);
-            using var bottom = LoadTemplate("wechat_bottom_template.png", scale);
-            if (top is null || bottom is null) return null;
-            if (top.Width >= screenshot.Width || bottom.Width >= screenshot.Width ||
-                top.Height >= screenshot.Height || bottom.Height >= screenshot.Height) return null;
             var frame = ToGray(screenshot, budget);
             var coarseFrame = Half(frame, budget);
-            var topGray = ToGray(top, budget);
-            var bottomGray = ToGray(bottom, budget);
             var topRegion = Rectangle.FromLTRB(frame.Width * 35 / 100, 0, frame.Width, frame.Height * 32 / 100);
-            var bottomRegion = Rectangle.FromLTRB(frame.Width * 15 / 100, frame.Height * 35 / 100, frame.Width, frame.Height);
-            var topSearch = Task.Run(() => Find(frame, coarseFrame, topGray, topRegion, budget), ct);
-            var bottomSearch = Task.Run(() => Find(frame, coarseFrame, bottomGray, bottomRegion, budget), ct);
-            var matches = Task.WhenAll(topSearch, bottomSearch).GetAwaiter().GetResult();
-            var topMatch = matches[0];
-            var bottomMatch = matches[1];
-            if (topMatch is null || bottomMatch is null || topMatch.Bounds.Bottom + topMatch.Bounds.Height >= bottomMatch.Bounds.Top ||
-                topMatch.Bounds.Right <= bottomMatch.Bounds.Left ||
-                topMatch.Bounds.Left + topMatch.Bounds.Width / 2 <= bottomMatch.Bounds.Left) return null;
-            budget.Check();
+            var bottomRegion = Rectangle.FromLTRB(0, frame.Height * 35 / 100, frame.Width, frame.Height);
             VisionBox Normalize(Rectangle rectangle) => new()
             {
                 X = rectangle.X * 1000d / frame.Width, Y = rectangle.Y * 1000d / frame.Height,
                 Width = rectangle.Width * 1000d / frame.Width, Height = rectangle.Height * 1000d / frame.Height
             };
-            return new() { TopToolbar = Normalize(topMatch.Bounds), BottomToolbar = Normalize(bottomMatch.Bounds),
-                TopScore = topMatch.Score, BottomScore = bottomMatch.Score, Scale = scale };
+            var alternate = preferred == WechatToolbarTheme.Dark ? WechatToolbarTheme.Light : WechatToolbarTheme.Dark;
+            var templateScale = dpi / 192d;
+            foreach (var theme in new[] { preferred, alternate })
+            {
+                budget.Check();
+                var suffix = theme == WechatToolbarTheme.Light ? "_light" : "";
+                using var top = LoadTemplate($"wechat_top_template{suffix}.png", templateScale);
+                using var bottom = LoadTemplate($"wechat_bottom_template{suffix}.png", templateScale);
+                if (top is null || bottom is null || top.Width >= frame.Width || bottom.Width >= frame.Width ||
+                    top.Height >= frame.Height || bottom.Height >= frame.Height) continue;
+                var topGray = ToGray(top, budget);
+                var bottomGray = ToGray(bottom, budget);
+                var topSearch = Task.Run(() => Find(frame, coarseFrame, topGray, topRegion, budget), ct);
+                var bottomSearch = Task.Run(() => Find(frame, coarseFrame, bottomGray, bottomRegion, budget), ct);
+                var matches = Task.WhenAll(topSearch, bottomSearch).GetAwaiter().GetResult();
+                var topMatch = matches[0];
+                var bottomMatch = matches[1];
+                if (topMatch is null || bottomMatch is null || topMatch.Bounds.Bottom + topMatch.Bounds.Height >= bottomMatch.Bounds.Top ||
+                    topMatch.Bounds.Right <= bottomMatch.Bounds.Left ||
+                    topMatch.Bounds.Left + topMatch.Bounds.Width / 2 <= bottomMatch.Bounds.Left) continue;
+                var anchors = new VisionAnchorHints
+                {
+                    TopToolbar = Normalize(topMatch.Bounds), BottomToolbar = Normalize(bottomMatch.Bounds),
+                    TopScore = topMatch.Score, BottomScore = bottomMatch.Score, Scale = templateScale
+                };
+                if (!accept(anchors)) continue;
+                budget.Check();
+                return (anchors, theme);
+            }
+            return null;
         }
         catch (Exception e) when (e is TimeoutException or ArgumentException or ExternalException or IOException)
         { return null; }

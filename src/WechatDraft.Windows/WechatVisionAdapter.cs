@@ -85,7 +85,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     {
         PreviewPng = null; _layout = null; _anchors = null;
         (VisionLayout Layout, VisionAnchorHints Anchors) located;
-        try { located = await Task.Run(() => WechatLocalLayout.Locate(bitmap, dpi, ct), ct); }
+        try { located = await Task.Run(() => WechatLocalLayout.Locate(bitmap, dpi, ct, _identity), ct); }
         catch (Exception e) { DebugSession.Current?.Event("local_layout_failed", new { type = e.GetType().Name, e.Message }); throw; }
         _layout = located.Layout; _anchors = located.Anchors;
         _frame ??= new(new Rectangle(0, 0, bitmap.Width, bitmap.Height), dpi);
@@ -172,21 +172,66 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         if (!desktop.Contains(_frame!.Bounds)) throw new InvalidOperationException("微信窗口部分位于屏幕之外，请完整显示后重试。");
         for (var row = 0; row < 5; row++)
             for (var col = 0; col < 7; col++)
-                CheckPoint(_bounds.Left + 16 + (_bounds.Width - 32) * col / 6, _bounds.Top + 16 + (_bounds.Height - 32) * row / 4);
-        var image = new Bitmap(_bounds.Width, _bounds.Height, PixelFormat.Format32bppArgb);
+                CheckPoint(_bounds.Left + 16 + (_bounds.Width - 32) * col / 6,
+                    _bounds.Top + 16 + (_bounds.Height - 32) * row / 4, debugStage ?? "window-capture");
+        var image = CaptureWindowPixels();
         try
         {
-            using (var graphics = Graphics.FromImage(image)) graphics.CopyFromScreen(_bounds.Left, _bounds.Top, 0, 0, image.Size);
             EnsureWindow(ct); _frame.ValidateImageSize(image.Size);
             if (debugStage is not null) DebugImage(debugStage, image);
             return image;
         }
         catch { image.Dispose(); throw; }
     }
-    private void CheckPoint(int x, int y)
+    private Bitmap CaptureWindowPixels()
     {
-        if (Native.GetAncestor(Native.WindowFromPoint(new Native.Point { X = x, Y = y }), 2) != target)
-            throw new InvalidOperationException("微信关键区域被遮挡，未继续预填。");
+        var image = new Bitmap(_bounds.Width, _bounds.Height, PixelFormat.Format32bppArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(image);
+            graphics.CopyFromScreen(_bounds.Left, _bounds.Top, 0, 0, image.Size);
+            return image;
+        }
+        catch { image.Dispose(); throw; }
+    }
+    private void CheckPoint(int x, int y, string stage)
+    {
+        var hit = Native.WindowFromPoint(new Native.Point { X = x, Y = y });
+        var root = Native.GetAncestor(hit, 2);
+        if (root == target) return;
+        if (Debug is { Enabled: true } debug)
+            RecordPointFailure(debug, x, y, stage, hit, root);
+        throw new InvalidOperationException("无法确认微信窗口在检查点可见，已停止本次视觉操作。");
+    }
+    private void RecordPointFailure(DebugSession debug, int x, int y, string stage, nint hit, nint root)
+    {
+        var checkedUtc = DateTimeOffset.UtcNow;
+        var localX = x - _bounds.Left;
+        var localY = y - _bounds.Top;
+        var foreground = Native.GetForegroundWindow();
+        try
+        {
+            using var image = CaptureWindowPixels();
+            using (var graphics = Graphics.FromImage(image))
+            using (var outline = new Pen(Color.White, 6))
+            using (var marker = new Pen(Color.Red, 3))
+            {
+                var circle = new Rectangle(localX - 12, localY - 12, 24, 24);
+                graphics.DrawEllipse(outline, circle);
+                graphics.DrawEllipse(marker, circle);
+            }
+            debug.WriteBytes("window-point-failed", Png(image), ".png");
+        }
+        catch (Exception e)
+        {
+            debug.Event("visual-window-point-image-failed", new { stage, type = e.GetType().Name });
+        }
+        debug.WriteJson("window-point-failed", new
+        {
+            stage, checkedUtc, screenPoint = new { x, y }, imagePoint = new { x = localX, y = localY },
+            target = target.ToInt64(), foreground = foreground.ToInt64(), window = _frame!.Bounds,
+            hit = hit.ToInt64(), root = root == 0 ? null : Native.DescribeWindow(root)
+        });
     }
     private bool Reject(string reason)
     {
@@ -273,7 +318,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     {
         if (!_guard!.Valid) throw new InvalidOperationException(StateChangeReason);
         EnsureModifiersReleased();
-        var point = InputPoint(); CheckPoint(point.X, point.Y); CheckActivity(version, ct);
+        var point = InputPoint(); CheckPoint(point.X, point.Y, "draft-read-click"); CheckActivity(version, ct);
         var clickStarted = Stopwatch.GetTimestamp();
         Native.VisionClick(point.X, point.Y); CheckActivity(version, ct);
         var shortcutsStarted = Stopwatch.GetTimestamp();
@@ -400,7 +445,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
                 EnsureModifiersReleased();
                 if ((Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0 ||
                     (Native.GetAsyncKeyState(0x04) & 0x8000) != 0) return Stop("mouse-button-held");
-                CheckPoint(x, y);
+                CheckPoint(x, y, "context-scroll-click");
                 try { Native.VisionClick(x, y); }
                 finally
                 {
@@ -471,7 +516,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
                 {
                     if (WechatLocalLayout.CanReuseGeometry(initial, currentFrame, _frame!.Dpi, _layout!, _anchors!, ct))
                         return (true, true);
-                    var located = WechatLocalLayout.Locate(currentFrame, _frame!.Dpi, ct);
+                    var located = WechatLocalLayout.Locate(currentFrame, _frame!.Dpi, ct, _identity);
                     return (WechatLocalLayout.SameGeometry(_layout!, located.Layout, currentFrame.Width, currentFrame.Height), false);
                 }, ct);
                 Debug?.Event("visual-prefill-layout-checked", new { reused, sameGeometry, elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds });
@@ -491,7 +536,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
             {
                 directInput = Native.PrepareUnicodeInput(greeting);
             }
-            var point = InputPoint(); CheckPoint(point.X, point.Y); CheckActivity(version, ct);
+            var point = InputPoint(); CheckPoint(point.X, point.Y, "prefill-click"); CheckActivity(version, ct);
             Native.VisionClick(point.X, point.Y);
             EnsureModifiersReleased();
             CheckActivity(version, ct);

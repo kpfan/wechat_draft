@@ -192,8 +192,7 @@ public sealed partial class MainWindow : Window
         _scene = Ui.Combo("祝福场景", ["春节", "元旦", "中秋", "端午", "生日", "纪念日", "通用问候"], _settings.Scene);
         _scene.IsEditable = true; _scene.Text = _settings.Scene;
         _zodiac = BuildZodiacSelector(_scene);
-        _extra = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：给老师，朴素一点；加 1–2 个 Emoji"); _extra.MaxLength = 300;
-        _extra.AcceptsReturn = true; _extra.Height = 86;
+        var extraEditor = BuildExtraInstructionEditor();
         _startButton = Ui.Button(_settings.DemoMode || _settings.EnableLiveAppend ? "✦  生成并预填草稿" : "✦  生成祝福", () => _ = StartTaskAsync(), true);
         _startButton.HorizontalAlignment = HorizontalAlignment.Stretch;
         _cancelButton = Ui.Button("取消任务", () => _runCancellation?.Cancel()); _cancelButton.IsEnabled = false;
@@ -201,7 +200,7 @@ public sealed partial class MainWindow : Window
         _progressDetail = Ui.Text(_settings.DemoMode ? "先体验完整流程，随后在设置中连接你的模型。" : "先配置 API 并选择目标微信窗口。", 12, "7C8981");
         _progressBar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 4, Foreground = Ui.Brush("258260") };
         var form = Ui.Stack(14, Ui.Text("生成一条合适的祝福", 19, bold: true), _mode,
-            _scene, _zodiac, _extra, Columns(_startButton, _cancelButton, 3, 1),
+            _scene, _zodiac, extraEditor, Columns(_startButton, _cancelButton, 3, 1),
             Ui.Stack(7, _progressTitle, _progressDetail, _progressBar));
         if (!_settings.DemoMode)
         {
@@ -238,6 +237,26 @@ public sealed partial class MainWindow : Window
         _runningHomeView = Present(Ui.Stack(22, header, _notice, body));
         if (_lastTaskProgress is { } progress) ShowProgress(progress.Stage, progress.Detail, progress.Percent);
         if (_lastTaskNotice is { } notice) Notify(notice.Text, notice.Severity);
+    }
+
+    private StackPanel BuildExtraInstructionEditor()
+    {
+        const int maxLength = 300;
+        var editor = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：语气亲切一点，带上称呼，加 1–2 个表情");
+        editor.MaxLength = maxLength;
+        editor.AcceptsReturn = true;
+        editor.TextWrapping = TextWrapping.Wrap;
+        editor.MinHeight = 112;
+        editor.MaxHeight = 232;
+        ScrollViewer.SetHorizontalScrollBarVisibility(editor, ScrollBarVisibility.Disabled);
+        ScrollViewer.SetVerticalScrollBarVisibility(editor, ScrollBarVisibility.Auto);
+        ScrollViewer.SetVerticalScrollMode(editor, ScrollMode.Enabled);
+        _extra = editor;
+
+        var count = Ui.Text($"{editor.Text.Length} / {maxLength}", 12, "73817A");
+        count.HorizontalAlignment = HorizontalAlignment.Right;
+        editor.TextChanged += (_, _) => count.Text = $"{editor.Text.Length} / {maxLength}";
+        return Ui.Stack(5, editor, count);
     }
 
     private ComboBox BuildZodiacSelector(ComboBox scene)

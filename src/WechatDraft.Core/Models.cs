@@ -56,11 +56,14 @@ public sealed record AppSettings : IJsonOnDeserializing
 
 public sealed record WindowLayoutSettings
 {
+    public const double DefaultWidthDip = 1360;
+    public const double DefaultHeightDip = 1240;
+
     // Screen position is physical pixels; dimensions remain logical across display scaling changes.
     public int Left { get; init; }
     public int Top { get; init; }
-    public double WidthDip { get; init; } = 840;
-    public double HeightDip { get; init; } = 740;
+    public double WidthDip { get; init; } = DefaultWidthDip;
+    public double HeightDip { get; init; } = DefaultHeightDip;
     // Retained for compatibility with older settings; new launches always use normal windows.
     public bool Maximized { get; init; }
 }

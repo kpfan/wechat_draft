@@ -1,15 +1,20 @@
 using System;
+using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using WechatDraft.Core;
+using Windows.UI.ViewManagement;
 
 namespace WechatDraft.Windows;
 
 // Geometry only. Toolbars and local edges do not prove chat identity, draft kind or single-chat state.
 internal static class WechatLocalLayout
 {
+    private static readonly Dictionary<string, WechatToolbarTheme> SuccessfulThemes = new();
+
     internal static bool CanReuseGeometry(Bitmap initial, Bitmap current, uint dpi, VisionLayout layout,
         VisionAnchorHints anchors, CancellationToken ct)
     {
@@ -55,13 +60,65 @@ internal static class WechatLocalLayout
             messages.Bottom <= frame.ToClientRectangle(located.Input!).Top;
     }
 
-    internal static (VisionLayout Layout, VisionAnchorHints Anchors) Locate(Bitmap image, uint dpi, CancellationToken ct)
+    internal static (VisionLayout Layout, VisionAnchorHints Anchors) Locate(Bitmap image, uint dpi, CancellationToken ct,
+        string? windowIdentity = null, Func<WechatToolbarTheme>? readWindowsTheme = null)
     {
-        var anchors = WechatTemplateLocator.Locate(image, dpi, ct);
-        DebugSession.Current?.WriteJson("template_match", new { method = "local-only", dpi, matched = anchors is not null, anchors });
-        if (anchors is null)
-            throw new System.IO.InvalidDataException("本地工具栏模板未可靠匹配，请完整显示微信聊天，并检查主题或显示缩放。未调用大模型定位。");
-        return (FromAnchors(image, dpi, anchors, ct), anchors);
+        ct.ThrowIfCancellationRequested();
+        WechatToolbarTheme? cached = null;
+        if (windowIdentity is { Length: > 0 })
+        {
+            lock (SuccessfulThemes)
+                if (SuccessfulThemes.TryGetValue(windowIdentity, out var theme)) cached = theme;
+        }
+        var preferred = cached ?? readWindowsTheme?.Invoke() ?? ReadWindowsTheme();
+        VisionAnchorHints? matchedAnchors = null;
+        VisionLayout? layout = null;
+        InvalidDataException? layoutError = null;
+        var result = WechatTemplateLocator.Locate(image, dpi, ct, preferred, anchors =>
+        {
+            matchedAnchors = anchors;
+            try
+            {
+                layout = FromAnchors(image, dpi, anchors, ct);
+                return true;
+            }
+            catch (InvalidDataException e)
+            {
+                layoutError ??= e;
+                return false;
+            }
+        });
+        DebugSession.Current?.WriteJson("template_match", new
+        {
+            method = "local-only", dpi, matched = matchedAnchors is not null, anchors = matchedAnchors,
+            preferredTheme = preferred.ToString(), theme = result?.Theme.ToString(), cached = cached is not null
+        });
+        if (result is not { } confirmed || layout is null)
+            throw layoutError ?? new InvalidDataException("本地工具栏模板未可靠匹配，请完整显示微信聊天，并检查主题或显示缩放。未调用大模型定位。");
+        ct.ThrowIfCancellationRequested();
+        if (windowIdentity is { Length: > 0 })
+        {
+            lock (SuccessfulThemes)
+            {
+                if (SuccessfulThemes.Count >= 32 && !SuccessfulThemes.ContainsKey(windowIdentity)) SuccessfulThemes.Clear();
+                SuccessfulThemes[windowIdentity] = confirmed.Theme;
+            }
+        }
+        return (layout, confirmed.Anchors);
+    }
+
+    private static WechatToolbarTheme ReadWindowsTheme()
+    {
+        try
+        {
+            var foreground = new UISettings().GetColorValue(UIColorType.Foreground);
+            return 5 * foreground.G + 2 * foreground.R + foreground.B > 8 * 128
+                ? WechatToolbarTheme.Dark : WechatToolbarTheme.Light;
+        }
+        catch (Exception e) when (e is COMException or InvalidOperationException or PlatformNotSupportedException)
+        {
+            return WechatToolbarTheme.Dark;
+        }
     }
 
     internal static VisionLayout FromAnchors(Bitmap image, uint dpi, VisionAnchorHints anchors, CancellationToken ct)
@@ -77,13 +134,13 @@ internal static class WechatLocalLayout
         var titleTop = Math.Max(0, top.Top - (int)Px(8));
         var titleBottom = top.Bottom + (int)Px(8);
         var messageTop = top.Bottom + (int)Px(14);
-        if (left < image.Width * .15 || right - left < Px(250) || top.Left - left < Px(100) ||
+        if (left < 0 || right - left < Px(250) || top.Left - left < Px(100) ||
             bottom.Right > right || messageTop >= bottom.Top)
             throw new System.IO.InvalidDataException("本地双锚点区域关系异常，未继续识别。");
         // Current WeChat puts the toolbar below the editor; older versions put it above.
         // A tall draft can put the separator above 40% of the window. Keep a usable
         // message area below the header and scan upwards from the input toolbar.
-        var separator = FindSeparator(image, left, right, messageTop + (int)Px(80),
+        var separator = FindSeparator(image, left, right, messageTop + (int)Px(64), messageTop + (int)Px(80),
             bottom.Top - (int)Px(3), Math.Max(2, (int)Px(3)), ct);
         if (separator < 0) throw new System.IO.InvalidDataException("本地未找到可靠的消息区与输入区分界，请调整微信窗口后重试。未调用大模型定位。");
         var inputBottom = image.Height - (int)Px(8);
@@ -111,7 +168,8 @@ internal static class WechatLocalLayout
         };
     }
 
-    private static int FindSeparator(Bitmap image, int left, int right, int start, int end, int gap, CancellationToken ct)
+    private static int FindSeparator(Bitmap image, int left, int right, int start, int fallbackStart, int end, int gap,
+        CancellationToken ct)
     {
         const int samples = 96;
         const int edgeSamples = 4;
@@ -154,6 +212,8 @@ internal static class WechatLocalLayout
                 }
             }
             if (Math.Max(dark, light) >= samples * .85) return y;
+            // A shorter message pane still needs a full, two-sided divider.
+            if (y < fallbackStart) continue;
             if (Math.Max(darkBelow, lightBelow) >= 90 && y + 7 * gap <= lastY &&
                 HasEditorOutline(pixels, region.Width, row, gap, sampleOffsets, lightBelow >= darkBelow ? 1 : -1))
             {
@@ -192,12 +252,15 @@ internal static class WechatLocalLayout
         }
         if (matchingTop < 90) return false;
 
-        var probe = Math.Max(1, gap / 2);
-        bool Stroke(int x, int relativeY)
+        // Antialiasing can change the apparent tone between the horizontal and vertical strokes.
+        var probe = Math.Max(2, gap / 2);
+        int StrokeContrast(int x, int relativeY)
         {
             var index = row + relativeY * stride + x * 4;
-            return Math.Abs(Gray(pixels, index) - tone) <= 3 &&
-                HasTwoSidedContrast(pixels, index, probe * 4, direction);
+            var center = Gray(pixels, index);
+            if (Math.Abs(center - tone) > 6) return 0;
+            return Math.Min(direction * (center - Gray(pixels, index - probe * 4)),
+                direction * (center - Gray(pixels, index + probe * 4)));
         }
         bool Corner(int edge, int inward)
         {
@@ -206,10 +269,12 @@ internal static class WechatLocalLayout
             for (var offset = probe; offset <= 6 * gap; offset++)
             {
                 var x = edge + inward * offset;
-                if (!Stroke(x, 3 * gap) || !Stroke(x, 5 * gap) || !Stroke(x, 7 * gap) ||
-                    Stroke(x, -gap) || Stroke(x, gap)) continue;
+                if (StrokeContrast(x, 3 * gap) < 3 || StrokeContrast(x, 5 * gap) < 3 ||
+                    StrokeContrast(x, 7 * gap) < 3 || StrokeContrast(x, -gap) >= 3) continue;
+                // At the turn, an inward stroke must be stronger than any fringe on the straight side.
+                var turnContrast = Math.Max(0, StrokeContrast(x, gap)) + 3;
                 for (var shift = 1; shift <= 2 * gap; shift++)
-                    if (Stroke(x + inward * shift, gap)) return true;
+                    if (StrokeContrast(x + inward * shift, gap) >= turnContrast) return true;
             }
             return false;
         }

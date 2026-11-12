@@ -8,12 +8,19 @@ internal static class WindowLayoutChecks
     {
         yield return ("Window layout preserves logical size across DPI changes and negative monitor origins", () =>
         {
-            var original = new Rectangle(-1800, 100, 1600, 1200);
+            var original = new Rectangle(-3000, 100, 2800, 2480);
             var saved = WindowLayoutRules.Capture(original, 192);
-            Equal(800d, saved.WidthDip); Equal(600d, saved.HeightDip); Equal(false, saved.Maximized);
-            var workArea = new Rectangle(-2560, -200, 2560, 1800);
+            Equal(1400d, saved.WidthDip); Equal(1240d, saved.HeightDip); Equal(false, saved.Maximized);
+            var workArea = new Rectangle(-3840, -200, 3840, 2900);
             Equal(original, WindowLayoutRules.Restore(saved, workArea, 192));
-            Equal(new Rectangle(-1800, 100, 1200, 900), WindowLayoutRules.Restore(saved, workArea, 144));
+            Equal(new Rectangle(-3000, 100, 2100, 1860), WindowLayoutRules.Restore(saved, workArea, 144));
+        });
+        yield return ("Opening an old small window provides more room for the main page", () =>
+        {
+            var workArea = new Rectangle(0, 0, 3072, 1872);
+            var saved = new WindowLayoutSettings { Left = 200, Top = 100, WidthDip = 840, HeightDip = 740 };
+            Equal(new Rectangle(200, 100, 1280, 1200), WindowLayoutRules.Restore(saved, workArea, 96));
+            Equal(new Rectangle(856, 316, 1360, 1240), WindowLayoutRules.Restore(null, workArea, 96));
         });
         yield return ("Removed monitors and small high-DPI desktops cannot restore a window off screen", () =>
         {
@@ -21,7 +28,7 @@ internal static class WindowLayoutChecks
             var workArea = new Rectangle(-1280, 0, 1280, 680);
             Equal(workArea, WindowLayoutRules.Restore(saved, workArea, 192));
             var tiny = WindowLayoutRules.Restore(saved with { WidthDip = 100, HeightDip = 100 }, workArea, 192);
-            Equal(workArea, tiny);
+            Equal(new Rectangle(-1152, 68, 1152, 612), tiny);
         });
         yield return ("Invalid legacy window dimensions recover to visible bounds", () =>
         {

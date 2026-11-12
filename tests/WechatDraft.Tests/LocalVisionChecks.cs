@@ -149,6 +149,43 @@ internal static class LocalVisionChecks
                 if (result.Status != "待手动处理") throw new Exception("A visual result authorized a write.");
             }
         });
+        yield return ("Local visual layout remembers a confirmed theme per window and recovers after it changes", () =>
+        {
+            var window = Guid.NewGuid().ToString("N");
+            var reads = 0;
+            WechatToolbarTheme ReadTheme() { reads++; return WechatToolbarTheme.Dark; }
+            using var light = TemplateLocatorChecks.Fixture(192, false, WechatToolbarTheme.Light);
+            MustReject(() => WechatLocalLayout.Locate(light, 192, default, window, ReadTheme));
+            using (var graphics = Graphics.FromImage(light))
+                graphics.DrawLine(Pens.Gray, 300, 450, light.Width - 5, 450);
+            _ = WechatLocalLayout.Locate(light, 192, default, window, ReadTheme);
+            _ = WechatLocalLayout.Locate(light, 192, default, window, ReadTheme);
+            using var dark = Fixture(192, false);
+            _ = WechatLocalLayout.Locate(dark, 192, default, window, ReadTheme);
+            _ = WechatLocalLayout.Locate(dark, 192, default, Guid.NewGuid().ToString("N"), ReadTheme);
+            if (reads != 3) throw new Exception("Theme hints must be read for new windows and cached only after valid geometry.");
+            return Task.CompletedTask;
+        });
+        yield return ("Local layout follows a left-shifted toolbar and a tall editor across window widths", () =>
+        {
+            const uint dpi = 144;
+            const int toolbarX = 112, chatLeft = 88, separator = 215;
+            foreach (var width in new[] { 636, 838 })
+            foreach (var theme in new[] { WechatToolbarTheme.Dark, WechatToolbarTheme.Light })
+            {
+                using var image = TemplateLocatorChecks.Fixture(dpi, false, theme, width, width - 216, toolbarX);
+                using (var graphics = Graphics.FromImage(image))
+                    graphics.DrawLine(Pens.Gray, chatLeft, separator, width - 12, separator);
+
+                var (layout, anchors) = WechatLocalLayout.Locate(image, dpi, default, readWindowsTheme: () => theme);
+                if (Math.Abs(anchors.BottomToolbar.X * width / 1000 - toolbarX) > 1 ||
+                    Math.Abs(layout.Chat!.X * width / 1000 - chatLeft) > 1 ||
+                    Math.Abs(layout.Input!.Y * image.Height / 1000 - separator) > 1 ||
+                    !layout.Input.Contains(layout.Editor!) || !layout.Input.Contains(layout.InputToolbar!))
+                    throw new Exception($"The left-shifted layout was incorrect at {width} px in {theme} theme.");
+            }
+            return Task.CompletedTask;
+        });
         yield return ("Local layout finds a tall editor boundary above two fifths of the window", () =>
         {
             const int separator = 310;
@@ -205,6 +242,52 @@ internal static class LocalVisionChecks
             var (layout, _) = WechatLocalLayout.Locate(framed, 192, default);
             if (Math.Abs(layout.Input!.Y * framed.Height / 1000 - y) > 1)
                 throw new Exception("The recovered divider does not align with the top of the editor.");
+            return Task.CompletedTask;
+        });
+        yield return ("Antialiased editor corners recover the divider when a message touches its upper edge", () =>
+        {
+            const uint dpi = 144;
+            const int y = 450, left = 326, right = 1088;
+            var topTone = Color.FromArgb(49, 49, 49);
+            var sideTone = Color.FromArgb(53, 53, 53);
+            using var image = TemplateLocatorChecks.Fixture(dpi, false);
+            using (var graphics = Graphics.FromImage(image))
+            using (var pen = new Pen(topTone))
+            using (var sidePen = new Pen(sideTone))
+            {
+                graphics.FillRectangle(Brushes.White, 400, 380, 540, y - 380);
+                graphics.DrawLine(pen, left + 20, y, right - 20, y);
+                graphics.DrawLine(sidePen, left + 12, y + 12, left + 12, y + 40);
+                graphics.DrawLine(sidePen, right - 8, y + 12, right - 8, y + 40);
+            }
+            image.SetPixel(left + 16, y + 4, sideTone);
+            image.SetPixel(right - 8, y + 4, topTone);
+            MustReject(() => WechatLocalLayout.Locate(image, dpi, default));
+
+            image.SetPixel(right - 9, y + 4, sideTone);
+            var (layout, _) = WechatLocalLayout.Locate(image, dpi, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - y) > 1)
+                throw new Exception("The antialiased editor corner moved the divider.");
+            return Task.CompletedTask;
+        });
+        yield return ("A two-pixel corner at 100 percent scaling recovers an obscured input divider", () =>
+        {
+            const int y = 450, left = 343, right = 1083;
+            using var image = TemplateLocatorChecks.Fixture(96, false);
+            using (var graphics = Graphics.FromImage(image))
+            {
+                graphics.FillRectangle(Brushes.White, 410, 400, 550, y - 400);
+                graphics.DrawLine(Pens.Gray, left + 8, y, right - 8, y);
+                foreach (var (edge, inward) in new[] { (left, 1), (right, -1) })
+                {
+                    var outer = Math.Min(edge, edge + inward);
+                    graphics.FillRectangle(Brushes.Gray, outer, y + 6, 2, 40);
+                    graphics.FillRectangle(Brushes.Gray, outer + inward * 3, y + 3, 2, 1);
+                }
+            }
+            var (layout, _) = WechatLocalLayout.Locate(image, 96, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - y) > 1)
+                throw new Exception("The recovered boundary is outside the input divider.");
             return Task.CompletedTask;
         });
         yield return ("Multiple separated partial divider candidates are rejected as ambiguous", () =>

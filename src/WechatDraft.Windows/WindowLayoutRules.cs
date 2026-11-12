@@ -17,8 +17,8 @@ public static class WindowLayoutRules
     {
         if (workArea.Width <= 0 || workArea.Height <= 0) throw new InvalidDataException("显示器工作区无效。");
         var scale = Scale(dpi);
-        var width = Extent(saved?.WidthDip ?? 840, 840, 720, workArea.Width, scale, saved is null);
-        var height = Extent(saved?.HeightDip ?? 740, 740, 520, workArea.Height, scale, saved is null);
+        var width = Extent(saved?.WidthDip, WindowLayoutSettings.DefaultWidthDip, 1280, workArea.Width, scale);
+        var height = Extent(saved?.HeightDip, WindowLayoutSettings.DefaultHeightDip, 1200, workArea.Height, scale);
         var left = saved?.Left ?? workArea.Left + (workArea.Width - width) / 2;
         var top = saved?.Top ?? workArea.Top + (workArea.Height - height) / 2;
         return new(Math.Clamp(left, workArea.Left, workArea.Right - width),
@@ -33,10 +33,12 @@ public static class WindowLayoutRules
     }
 
     private static double Scale(uint dpi) => dpi is >= 48 and <= 960 ? dpi / 96d : 1;
-    private static int Extent(double value, double fallback, double minimum, int available, double scale, bool firstRun)
+    private static int Extent(double? saved, double fallback, double minimum, int available, double scale)
     {
-        if (!double.IsFinite(value) || value <= 0) value = fallback;
-        var maximum = firstRun ? available * 0.9 : available;
-        return (int)Math.Round(Math.Clamp(value * scale, Math.Min(minimum * scale, maximum), maximum));
+        var preferredLimit = Math.Max(1, available * .9);
+        if (saved is not { } value || !double.IsFinite(value) || value <= 0)
+            return (int)Math.Round(Math.Min(fallback * scale, preferredLimit));
+        var minimumOnScreen = Math.Min(minimum * scale, preferredLimit);
+        return (int)Math.Round(Math.Clamp(value * scale, minimumOnScreen, available));
     }
 }

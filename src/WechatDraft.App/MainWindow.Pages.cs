@@ -92,7 +92,7 @@ public sealed partial class MainWindow
         _homeVisible = false;
         var dirty = false;
         var automation = Ui.Combo("微信识别方式", ["自动 · UIA 优先", "仅 UIA", "仅视觉"], AutomationLabel(_settings.AutomationMode));
-        var liveAppend = new CheckBox { Content = "生成后预填到微信输入框（与首页选项同步）", IsChecked = _settings.EnableLiveAppend };
+        var liveAppend = new CheckBox { Content = "允许选中候选后预填（与首页选项同步）", IsChecked = _settings.EnableLiveAppend };
         var debugMode = new CheckBox { Content = "调试模式：保存中间截图和模型日志", IsChecked = DebugSession.IsSupported && _settings.DebugMode,
             IsEnabled = DebugSession.IsSupported };
         var account = Ui.Input("本地微信账号工作区", _settings.AccountScope, "更换微信账号时请更改工作区名称");
@@ -130,7 +130,7 @@ public sealed partial class MainWindow
             catch (Exception e) { Feedback(e.Message, false); }
         }, true);
         var options = Ui.Card(Ui.Stack(17, Ui.Text("工作区与预填", 20, bold: true), automation, account, hotkey, retention, liveAppend,
-            Ui.Text("预填默认关闭，与首页选项同步。生成期间可以浏览本软件，填写前最多等待 30 秒返回原微信聊天，不抢占窗口。转到其他程序、切换聊天、修改草稿或输入焦点不安全时不填写。复查当前聊天面板、标题、输入控件和原草稿；支持的界面不要求左侧联系人一直可见。不会自动发送。", 12, "8B7953"),
+            Ui.Text("预填默认关闭，与首页选项同步。真实模式先生成三个候选，明确选中后才可点击预填；最初的会话和原稿检查最长保留十分钟。生成期间可以浏览本软件，填写前最多等待 30 秒返回原微信聊天，不抢占窗口。转到其他程序、切换聊天、修改草稿或输入焦点不安全时不填写。复查当前聊天面板、标题、输入控件和原草稿；支持的界面不要求左侧联系人一直可见。不会自动发送。", 12, "8B7953"),
             Ui.Text("视觉模式用本地 OCR 读取并复查标题。开启预填后，会核对完整原文、追加并读回确认；复制或标题不明确时只保留生成结果。生成时可查看助手，实际读取和填写须回到原微信聊天。不会自动发送。", 12, "8B7953"),
             debugMode,
             Ui.Text(DebugSession.IsSupported ? "调试模式会在程序旁的 debug 文件夹按任务保存截图、模型原始返回、定位结果和日志，可能含联系人、聊天及草稿。关闭后不再新增，已有文件保留。密钥始终不写入日志。" : "当前为正式版本，调试记录已在构建时禁用，不保存中间截图和模型日志。", 12, "7F8D82"),

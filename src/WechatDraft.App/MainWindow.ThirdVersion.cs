@@ -3,336 +3,206 @@ using Microsoft.UI.Xaml.Controls;
 using WechatDraft.Core;
 using WechatDraft.Core.ThirdVersion;
 using WechatDraft.Windows;
-using Windows.Storage.Pickers;
 
 namespace WechatDraft.App;
 
 public sealed partial class MainWindow
 {
     private ThirdVersionService? _thirdService;
-    private ThirdVersionSession? _thirdSession;
-    private ScrollViewer? _thirdView;
-    private TextBox? _thirdScene, _thirdExtra, _thirdManual, _thirdInstruction;
-    private TextBlock? _thirdStatus, _thirdEvidence, _thirdCurrent, _thirdTurns, _thirdFiles;
+    private ThirdVersionWorkflow? _thirdWorkflow;
+    private ThirdVersionRun? _thirdRun;
+    private DispatcherTimer? _thirdExpiryTimer;
+    private TextBlock? _thirdEvidence, _thirdCurrent, _thirdTurns, _thirdState;
+    private TextBox? _thirdManual, _thirdInstruction;
     private StackPanel? _thirdCandidates, _thirdUnknown;
-    private ComboBox? _thirdWindows;
+    private Button? _thirdResolve, _thirdNeutral, _thirdRegenerate, _thirdRetry, _thirdRevise, _thirdReset, _thirdAppend, _thirdCopy;
     private readonly List<Control> _thirdActions = [];
-    private readonly List<Capture> _thirdImported = [];
-    private int _thirdSelected;
-    private bool _thirdBusy;
-    private string _thirdDisplayName = "截图实验";
-    private TaskRecord? _thirdHistory;
 
-    private ThirdVersionService ThirdService => _thirdService ??= new ThirdVersionService(
-        Path.Combine(AppContext.BaseDirectory, "config", "third-version"));
-
-    private Button ThirdButton(string label, Action action, bool primary = false)
+    private ThirdVersionWorkflow ThirdWorkflow
     {
-        var button = Ui.Button(label, action, primary);
-        button.IsEnabled = !_thirdBusy;
+        get
+        {
+            if (_thirdWorkflow is not null) return _thirdWorkflow;
+            _thirdService = new ThirdVersionService(Path.Combine(AppContext.BaseDirectory, "config", "third-version"));
+            _thirdWorkflow = new ThirdVersionWorkflow(_repository, _protector, _thirdService);
+            _thirdWorkflow.Progress += progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent));
+            return _thirdWorkflow;
+        }
+    }
+
+    private Button ThirdAction(string text, Action action, bool primary = false)
+    {
+        var button = Ui.Button(text, action, primary);
         _thirdActions.Add(button);
         return button;
     }
 
-    private void ShowThirdVersion()
+    // This is the result area of the existing real-WeChat home, not a separate page.
+    private UIElement BuildThirdVersionResult()
     {
-        SelectNavigation(nameof(ShowThirdVersion));
-        if (_thirdView is not null) { _page.Content = _thirdView; return; }
-        _thirdScene = Ui.Input("祝福场景", _settings.Scene, "春节、教师节、生日……");
-        _thirdScene.MaxLength = 100;
-        _thirdExtra = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：再朴素一点；不要表情");
-        _thirdExtra.AcceptsReturn = true; _thirdExtra.MaxLength = 300;
-        _thirdWindows = new ComboBox { Header = "采集目标（只读，不预填）", HorizontalAlignment = HorizontalAlignment.Stretch };
-        _thirdActions.Add(_thirdWindows);
-        ThirdRefreshWindows();
-        _thirdFiles = Ui.Text("尚未导入截图。支持 1–4 张 PNG，总计不超过 12 MiB。", 12, "71817B");
-        _thirdStatus = Ui.Text("准备就绪。可先点“离线演示”检查完整交互，不调用模型。", 13, "416A56");
-        _thirdEvidence = Ui.Text("提取结果会在这里显示。", 13);
+        _thirdActions.Clear();
+        _thirdEvidence = Ui.Text("自动采集当前微信聊天后，先提取称呼，再生成三个候选。", 13, "71817B");
         _thirdEvidence.IsTextSelectionEnabled = true;
-        _thirdManual = Ui.Input("本次称呼", "", "例如：王老师（仅本次使用，不保存联系人）"); _thirdManual.MaxLength = 30;
-        _thirdUnknown = Ui.Stack(10, Ui.Text("暂时无法确定称呼，请选择下一步", 16, bold: true),
-            _thirdManual, ThirdButton("使用填写的称呼生成", () => _ = ThirdResolveAsync(false)),
-            ThirdButton("不带称呼，生成中性祝福", () => _ = ThirdResolveAsync(true)));
-        _thirdUnknown.Visibility = Visibility.Collapsed;
-        _thirdCandidates = Ui.Stack(10);
-        _thirdCurrent = Ui.Text("先生成三个候选，再选择要使用或修改的一条。", 16); _thirdCurrent.IsTextSelectionEnabled = true;
-        _thirdCurrent.LineHeight = 28;
-        _thirdInstruction = Ui.Input("修改意见", "", "例如：再短一点；还是用您吧；去掉感叹号");
+        _thirdState = Ui.Text("尚未生成。", 12, "71817B");
+        _thirdManual = Ui.Input("本次称呼", "", "例如：王老师；仅本次使用，不修改联系人档案");
+        _thirdManual.MaxLength = 30;
+        _thirdResolve = ThirdAction("使用填写的称呼生成", () => _ = ThirdOperateAsync(ct => ThirdWorkflow.GenerateAsync(RequireThirdRun(), _thirdManual.Text.Trim(), false, ct)));
+        _thirdNeutral = ThirdAction("不带称呼，生成中性祝福", () => _ = ThirdOperateAsync(ct => ThirdWorkflow.GenerateAsync(RequireThirdRun(), null, true, ct)));
+        _thirdUnknown = Ui.Stack(10, Ui.Text("称呼不确定，请选择下一步", 16, bold: true), _thirdManual, Ui.Row(8, _thirdResolve, _thirdNeutral));
+        _thirdCandidates = Ui.Stack(12);
+        _thirdRegenerate = ThirdAction("重新生成三个候选", () => _ = ThirdOperateAsync(ct => ThirdWorkflow.RegenerateAsync(RequireThirdRun(), ct)));
+        _thirdRetry = ThirdAction("按已有提取结果重试生成", () => _ = ThirdOperateAsync(ct =>
+        {
+            var run = RequireThirdRun();
+            return ThirdWorkflow.GenerateAsync(run, null, run.Session?.Contact is { Confirmed: true } contact && string.IsNullOrWhiteSpace(contact.AddressTerm), ct);
+        }));
+        _thirdCurrent = Ui.Text("生成后请先选择一条候选，再修改、复制或预填。", 16, "385347");
+        _thirdCurrent.IsTextSelectionEnabled = true; _thirdCurrent.LineHeight = 29;
+        _thirdInstruction = Ui.Input("修改意见", "", "例如：再短一点；更正式一些；去掉表情");
         _thirdInstruction.AcceptsReturn = true; _thirdInstruction.MaxLength = 1000;
-        _thirdTurns = Ui.Text("当前候选还没有修改记录。", 12, "71817B"); _thirdTurns.IsTextSelectionEnabled = true;
-        var content = Ui.Stack(18,
-            Ui.Text("第三版实验", 28, bold: true),
-            Ui.Text("先提取称呼，再生成三个候选。支持重新生成、候选独立的多轮修改和称呼确认。沿用 API 管理中选定的服务。", 13, "71817B"),
-            Ui.Card(Ui.Stack(12, _thirdScene, _thirdExtra, _thirdWindows,
-                ThirdButton("刷新微信窗口", ThirdRefreshWindows),
-                ThirdButton("只读采集当前聊天并生成", () => _ = ThirdCaptureAsync(), true),
-                ThirdButton("导入聊天截图…", () => _ = ThirdImportAsync()), _thirdFiles,
-                ThirdButton("使用导入截图生成", () => _ = ThirdFromImportedAsync()),
-                ThirdButton("离线演示（不调用模型）", ThirdDemo),
-                Ui.Button("取消当前操作", () => _runCancellation?.Cancel()), _thirdStatus)),
-            Ui.Card(Ui.Stack(12, Ui.Text("称呼与依据", 18, bold: true), _thirdEvidence, _thirdUnknown)),
-            Ui.Card(Ui.Stack(12, Ui.Text("三个候选", 18, bold: true), _thirdCandidates,
-                ThirdButton("重新生成三个候选", () => _ = ThirdRegenerateAsync()),
-                ThirdButton("按提取结果重试首次生成", () => _ = ThirdRetryGenerateAsync()))),
-            Ui.Card(Ui.Stack(12, Ui.Text("当前选择与多轮修改", 18, bold: true), _thirdCurrent,
-                ThirdButton("复制当前正文", ThirdCopy), _thirdInstruction,
-                ThirdButton("按意见修改", () => _ = ThirdReviseAsync(), true),
-                ThirdButton("重置当前候选的修改", ThirdReset), _thirdTurns)),
-            Ui.Card(Ui.Stack(8, Ui.Text("提示词与示例", 18, bold: true),
-                Ui.Text("修改 config/third-version 中的规则或示例，下次生成读取新内容。格式错误会明确提示。示例与旧版“祝福范例”分开，避免重复注入。", 12, "71817B"),
-                ThirdButton("打开提示词与示例目录", () => global::Windows.System.Launcher.LaunchFolderPathAsync(
-                    Path.Combine(AppContext.BaseDirectory, "config", "third-version")).AsTask().ContinueWith(_ => { })))),
-            Ui.Text("本实验入口只生成、复制并保存选中文案到本地加密历史，不自动预填、不发送。更换截图会开始新会话；原来的生成与安全预填入口保持不变。", 12, "8B7953"));
-        _thirdView = Present(content);
-    }
-
-    private void ThirdRefreshWindows()
-    {
-        if (_thirdWindows is null || _thirdBusy) return;
-        try
+        _thirdRevise = ThirdAction("按意见修改当前候选", () => _ = ThirdOperateAsync(async ct =>
         {
-            var old = _thirdWindows.SelectedItem as WechatWindow;
-            var windows = WechatAdapter.FindWindows().ToArray();
-            _thirdWindows.Items.Clear();
-            foreach (var window in windows) _thirdWindows.Items.Add(window);
-            _thirdWindows.SelectedItem = WechatWindowSelection.Select(windows, old);
-            _thirdWindows.PlaceholderText = windows.Length == 0 ? "未找到微信，可先导入截图或离线演示" : "请选择微信窗口";
-        }
-        catch (Exception e) { if (_thirdStatus is not null) _thirdStatus.Text = "枚举窗口失败：" + e.Message; }
+            var run = RequireThirdRun();
+            var result = await ThirdWorkflow.ReviseAsync(run, run.SelectedIndex, _thirdInstruction.Text.Trim(), ct);
+            if (result is not null) _thirdInstruction.Text = "";
+        }), true);
+        _thirdReset = ThirdAction("重置当前候选的修改", () => ThirdSyncAction(() =>
+        {
+            var run = RequireThirdRun(); ThirdWorkflow.Reset(run, run.SelectedIndex);
+        }));
+        _thirdCopy = ThirdAction("复制当前正文", () => CopyText(ThirdSelectedText()));
+        _thirdAppend = ThirdAction("预填当前选中正文", () => _ = ThirdOperateAsync(ct => ThirdWorkflow.AppendSelectedAsync(RequireThirdRun(), ct)), true);
+        _thirdTurns = Ui.Text("每条候选保留自己的修改记录，切换不会串上下文。", 12, "71817B");
+        _thirdTurns.IsTextSelectionEnabled = true;
+        var content = Ui.Stack(14,
+            Ui.Text("本次祝福 · 三个候选", 19, bold: true), _thirdEvidence, _thirdUnknown,
+            Ui.Row(8, _thirdRegenerate, _thirdRetry), _thirdCandidates,
+            Ui.Text("当前选中正文", 17, bold: true), _thirdCurrent,
+            _thirdInstruction, Ui.Row(8, _thirdRevise, _thirdReset), _thirdTurns,
+            Ui.Row(8, _thirdCopy, _thirdAppend), _thirdState,
+            Ui.Text("候选需由你明确选择。预填只尝试一次，保留原草稿，不发送；原聊天或草稿变化、超过 10 分钟或关闭预填时只能复制。", 12, "8D713D"),
+            Ui.Button("打开提示词与示例目录", () => _ = OpenThirdPromptsAsync()));
+        ThirdRenderHome();
+        return Ui.Card(content, "F0F7F1", 22);
     }
 
-    private AppSettings ThirdSettings() => _settings with
+    private async Task OpenThirdPromptsAsync()
     {
-        Scene = _thirdScene!.Text.Trim(), ExtraInstruction = _thirdExtra!.Text.Trim(),
-        DemoMode = false, EnableLiveAppend = false, ApiProfiles = _settings.ApiProfiles.ToList()
-    };
+        try { await global::Windows.System.Launcher.LaunchFolderPathAsync(Path.Combine(AppContext.BaseDirectory, "config", "third-version")); }
+        catch (Exception e) { Notify("打开提示词目录失败：" + e.Message, InfoBarSeverity.Warning); }
+    }
 
-    private async Task ThirdRunAsync(string stage, Func<CancellationToken, Task> operation)
+    private ThirdVersionRun RequireThirdRun() => _thirdRun ?? throw new InvalidOperationException("请先点击生成祝福，自动采集当前微信聊天。");
+
+    private async Task StartThirdVersionTaskAsync(AppSettings settings, WechatWindow window)
     {
-        if (IsTaskBusy || _thirdBusy) { _thirdStatus!.Text = "已有任务正在进行，请先完成或取消。"; return; }
+        await ThirdOperateAsync(async ct =>
+        {
+            if (_thirdRun is not null) await ThirdWorkflow.ReleaseAsync(_thirdRun);
+            _thirdRun = null;
+            // The original adapter decides UIA/visual routing, foreground waits, screenshot bounds and identity checks.
+            var adapter = CreateConversationAdapter(window.Handle, settings);
+            _thirdRun = await ThirdWorkflow.StartAsync(settings, adapter, ct);
+            StartThirdExpiryTimer();
+        });
+    }
+
+    private async Task ThirdOperateAsync(Func<CancellationToken, Task> operation)
+    {
+        if (IsTaskBusy) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
         _runCancellation = new CancellationTokenSource();
-        _thirdBusy = true;
-        foreach (var control in _thirdActions) control.IsEnabled = false;
-        _thirdScene!.IsEnabled = _thirdExtra!.IsEnabled = _thirdManual!.IsEnabled = _thirdInstruction!.IsEnabled = false;
-        SetBusy(true);
-        _thirdStatus!.Text = stage;
-        try
-        {
-            await operation(_runCancellation.Token);
-            _thirdStatus.Text = $"操作完成 · 累计实际模型请求 {_thirdSession?.ApiCallCount ?? 0} 次 · 只生成，不预填";
-        }
-        catch (OperationCanceledException) { _thirdStatus.Text = "已取消或超过时间预算。没有预填或发送。已有候选仍可查看。"; }
-        catch (Exception e) { _thirdStatus.Text = "操作失败：" + e.Message; }
+        SetBusy(true); ThirdSetBusy(true);
+        try { await operation(_runCancellation.Token); }
+        catch (OperationCanceledException) { Notify("已取消，没有重复预填。已有候选仍可查看。", InfoBarSeverity.Warning); }
+        catch (Exception e) { Notify("处理未完成：" + e.Message, InfoBarSeverity.Error); }
         finally
         {
             _runCancellation.Dispose(); _runCancellation = null;
-            _thirdBusy = false;
-            foreach (var control in _thirdActions) control.IsEnabled = true;
-            _thirdScene!.IsEnabled = _thirdExtra!.IsEnabled = _thirdManual!.IsEnabled = _thirdInstruction!.IsEnabled = true;
-            SetBusy(false);
-            ThirdRender();
-        }
-    }
-
-    private async Task ThirdImportAsync()
-    {
-        if (IsTaskBusy || _thirdBusy) return;
-        try
-        {
-            var picker = new FileOpenPicker();
-            WinRT.Interop.InitializeWithWindow.Initialize(picker, WinRT.Interop.WindowNative.GetWindowHandle(this));
-            picker.FileTypeFilter.Add(".png");
-            var files = await picker.PickMultipleFilesAsync();
-            if (files.Count == 0) return;
-            if (files.Count > 4) throw new InvalidDataException("最多选择四张截图。");
-            var selected = new List<Capture>(); long total = 0;
-            foreach (var file in files)
+            if (_thirdRun is { } run)
             {
-                var info = new FileInfo(file.Path); total += info.Length;
-                if (info.Length == 0 || total > 12 * 1024 * 1024) throw new InvalidDataException("截图为空或总量超过 12 MiB。");
-                var bytes = await File.ReadAllBytesAsync(file.Path);
-                if (bytes.Length < 8 || !bytes.AsSpan(0, 8).SequenceEqual(new byte[] { 137, 80, 78, 71, 13, 10, 26, 10 }))
-                    throw new InvalidDataException("请选择有效的 PNG 图片。");
-                selected.Add(new Capture("import_" + selected.Count, bytes, true));
+                _latest = run.Record;
+                if (_resultText is not null) _resultText.Text = ThirdSelectedText();
+                if (_resultStatus is not null) _resultStatus.Text = run.Record.FillStatus;
+                var detail = run.Record.Error.Length > 0 ? run.Record.Error : run.Session?.Candidates.Count == 3 ? "请选择一条候选。" : "请确认本次称呼。";
+                Notify(run.Record.FillStatus + " · " + detail, run.Record.GenerationStatus == "失败" ? InfoBarSeverity.Warning : InfoBarSeverity.Informational);
             }
-            _thirdImported.Clear(); _thirdImported.AddRange(selected);
-            _thirdFiles!.Text = $"已导入 {selected.Count} 张 PNG。仅在点击生成后，向已授权服务上传。";
-            _thirdStatus!.Text = "截图已准备好；点击“使用导入截图生成”开始新会话。";
+            SetBusy(false); ThirdSetBusy(false); ThirdRenderHome();
         }
-        catch (Exception e) { _thirdStatus!.Text = "导入失败：" + e.Message; }
     }
 
-    private Task ThirdFromImportedAsync() => ThirdRunAsync("正在提取截图中的称呼……", async ct =>
+    private void ThirdSyncAction(Action action)
     {
-        if (_thirdImported.Count == 0) throw new InvalidDataException("请先导入聊天截图。");
-        _thirdDisplayName = "截图实验"; _thirdHistory = null;
-        await ThirdExtractAsync(ThirdSettings(), _thirdImported.ToArray(), null, new([]), ct);
-    });
-
-    private Task ThirdCaptureAsync() => ThirdRunAsync("准备只读采集；请切回所选微信聊天……", async ct =>
-    {
-        if (_thirdWindows?.SelectedItem is not WechatWindow window) throw new InvalidDataException("请先选择微信窗口。");
-        var settings = ThirdSettings();
-        // Consent is checked before taking a screenshot; this page never receives append authority.
-        if (settings.AuthorizedOrigin != DraftRules.Origin(settings)) throw new InvalidDataException("请先在 API 管理授权向当前服务上传必要聊天截图。");
-        using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        budget.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(settings.TaskTimeoutSeconds, 10, 180)));
-        IConversationAdapter adapter = CreateConversationAdapter(window.Handle, settings);
-        ConversationSnapshot? snapshot = null;
-        try
-        {
-            // A short visible countdown gives the user time to foreground WeChat; no activation/click is issued.
-            for (var seconds = 3; seconds > 0; seconds--)
-            { _thirdStatus!.Text = $"{seconds} 秒后只读采集，请切回目标微信聊天。不会自动点击或填写。"; await Task.Delay(1000, budget.Token); }
-            snapshot = await adapter.BeginAsync(budget.Token);
-            if (snapshot.DisplayNameRead && DraftRules.LooksLikeGroupTitle(snapshot.DisplayName)) throw new GroupChatDetectedException();
-            var capture = await adapter.CaptureAsync(snapshot, 0, budget.Token);
-            _thirdDisplayName = snapshot.DisplayName;
-            var contact = snapshot.DisplayNameRead ? _repository.FindContactByName(settings.AccountScope, snapshot.DisplayName) : null;
-            var context = new GreetingGenerationContext(_repository.RecentGreetings(settings.AccountScope, contact?.Id,
-                snapshot.DisplayName, settings.Scene, false, budget.Token));
-            _thirdHistory = null;
-            await ThirdExtractAsync(settings, [capture], contact, context, budget.Token);
-        }
-        finally
-        {
-            if (snapshot is not null) { try { await adapter.RestoreAsync(snapshot); } catch { } }
-            if (adapter is IDisposable disposable) disposable.Dispose();
-        }
-    });
-
-    private async Task ThirdExtractAsync(AppSettings settings, IReadOnlyList<Capture> captures, Contact? contact,
-        GreetingGenerationContext context, CancellationToken ct)
-    {
-        // Drop the old branch before extraction so failed new input can never be resolved against an older chat.
-        _thirdSession = null;
-        var session = await ThirdService.ExtractAsync(settings, _protector.Unprotect(settings.ProtectedApiKey), captures, contact, context, ct);
-        _thirdSession = session; _thirdSelected = 0;
-        if (session.Extraction.Name is not null || contact is { Confirmed: true })
-        {
-            _thirdStatus!.Text = "称呼提取完成，正在生成三个候选……";
-            await ThirdService.GenerateAsync(session, null, contact is { Confirmed: true } && string.IsNullOrWhiteSpace(contact.AddressTerm), ct);
-            ThirdSaveSelection();
-        }
-        // Unknown leaves session visible and waits for explicit user action; no model generation is issued.
+        if (IsTaskBusy) return;
+        try { action(); _latest = _thirdRun?.Record; ThirdRenderHome(); }
+        catch (Exception e) { Notify(e.Message, InfoBarSeverity.Warning); }
     }
 
-    private Task ThirdRetryGenerateAsync() => ThirdRunAsync("正在使用已有提取结果重新生成……", async ct =>
-    {
-        var session = _thirdSession ?? throw new InvalidDataException("请先提取截图。");
-        if (session.IsDemo) throw new InvalidDataException("离线演示只供查看，真实生成请导入截图并配置 API。");
-        if (session.Candidates.Count > 0) throw new InvalidDataException("已有候选，请使用重新生成。");
-        await ThirdService.GenerateAsync(session, null, session.Contact is { Confirmed: true } contact && string.IsNullOrWhiteSpace(contact.AddressTerm), ct);
-        _thirdSelected = 0; ThirdSaveSelection();
-    });
+    private string ThirdSelectedText() => _thirdRun is { Session: { Revisions.Count: 3 } session, SelectedIndex: >= 0 and < 3 } run
+        ? session.Revisions[run.SelectedIndex].Greeting : "";
 
-    private Task ThirdResolveAsync(bool neutral) => ThirdRunAsync("正在按你的称呼选择生成三个候选……", async ct =>
+    private void ThirdSetBusy(bool busy)
     {
-        var session = _thirdSession ?? throw new InvalidDataException("请先提取截图。");
-        var address = _thirdManual!.Text.Trim();
-        if (!neutral && address.Length == 0) throw new InvalidDataException("请填写本次称呼，或选择中性祝福。");
-        await ThirdService.GenerateAsync(session, neutral ? null : address, neutral, ct);
-        _thirdSelected = 0; ThirdSaveSelection();
-    });
-
-    private Task ThirdRegenerateAsync() => ThirdRunAsync("正在重新生成三个候选……", async ct =>
-    {
-        var session = _thirdSession ?? throw new InvalidDataException("请先生成候选。");
-        await ThirdService.RegenerateAsync(session, ct);
-        _thirdSelected = 0; _thirdHistory = null; ThirdSaveSelection();
-    });
-
-    private Task ThirdReviseAsync() => ThirdRunAsync("正在修改当前候选（保留该候选的上下文）……", async ct =>
-    {
-        var session = _thirdSession ?? throw new InvalidDataException("请先生成候选。");
-        await ThirdService.ReviseAsync(session, _thirdSelected, _thirdInstruction!.Text.Trim(), ct);
-        _thirdInstruction.Text = ""; ThirdSaveSelection();
-    });
-
-    private void ThirdReset()
-    {
-        if (_thirdBusy || IsTaskBusy || _thirdSession?.Candidates.Count != 3) return;
-        if (_thirdSession.IsDemo) { _thirdStatus!.Text = "离线演示没有修改历史，无需重置。"; return; }
-        ThirdService.ResetRevision(_thirdSession, _thirdSelected);
-        ThirdSaveSelection(); ThirdRender();
+        foreach (var control in _thirdActions) control.IsEnabled = !busy;
+        if (_thirdManual is not null) _thirdManual.IsEnabled = !busy;
+        if (_thirdInstruction is not null) _thirdInstruction.IsEnabled = !busy;
     }
 
-    private void ThirdDemo()
+    private void ThirdRenderHome()
     {
-        if (_thirdBusy || IsTaskBusy) return;
-        _thirdSession = ThirdService.CreateDemoSession(_thirdScene!.Text.Trim(), _thirdExtra!.Text.Trim());
-        _thirdSelected = 0; _thirdDisplayName = "离线演示联系人"; _thirdHistory = null;
-        _thirdStatus!.Text = "离线演示：虚构联系人，不调用模型、不采集微信。可切换候选及复制；真实重生成和修改请导入截图并配置 API。";
-        ThirdRender();
-    }
-
-    private string ThirdCurrentText() => _thirdSession is { Candidates.Count: 3, Revisions.Count: 3 } session
-        ? session.Revisions[Math.Clamp(_thirdSelected, 0, 2)].Greeting : "";
-
-    private void ThirdCopy()
-    {
-        var text = ThirdCurrentText();
-        if (text.Length == 0) { _thirdStatus!.Text = "请先生成并选择候选。"; return; }
-        CopyText(text); ThirdSaveSelection();
-        _thirdStatus!.Text = "已复制当前正文。请自行检查并手动发送。";
-    }
-
-    private void ThirdSaveSelection()
-    {
-        var session = _thirdSession; var text = ThirdCurrentText();
-        if (session is null || text.Length == 0 || session.IsDemo) return;
-        _thirdHistory ??= new TaskRecord { AccountScope = session.Settings.AccountScope, Scene = session.Settings.Scene,
-            DisplayName = _thirdDisplayName, Model = session.Settings.Model, AutomationMethod = "third-version-experiment",
-            FillStatus = "待手动处理", IsDemo = false };
-        _thirdHistory.Greeting = text; _thirdHistory.GeneratedAt = DateTimeOffset.UtcNow;
-        _thirdHistory.GenerationStatus = "成功"; _thirdHistory.CompletedAt = DateTimeOffset.UtcNow;
-        _thirdHistory.ApiCallCount = session.ApiCallCount; _thirdHistory.CaptureCount = session.Captures.Count;
-        _thirdHistory.AddressTerm = session.ResolvedAddress;
-        _thirdHistory.AddressTermSource = session.Neutral ? "unknown" : session.Extraction.Name == session.ResolvedAddress ? "third_version_" + session.Extraction.Basis : "user";
-        _thirdHistory.Error = "第三版实验：仅生成和复制，没有申请微信预填权限。";
-        _repository.SaveTask(_thirdHistory);
-    }
-
-    private void ThirdRender()
-    {
-        if (_thirdEvidence is null || _thirdSession is not { } session)
-        {
-            if (_thirdCandidates is not null) _thirdCandidates.Children.Clear();
-            if (_thirdUnknown is not null) _thirdUnknown.Visibility = Visibility.Collapsed;
-            if (_thirdEvidence is not null) _thirdEvidence.Text = "尚未获得提取结果。";
-            if (_thirdCurrent is not null) _thirdCurrent.Text = "请先提取截图并生成候选。";
-            return;
-        }
-        foreach (var control in _thirdActions.OfType<Button>())
-        {
-            if (control.Content is string label && (label is "重新生成三个候选" or "按提取结果重试首次生成" or "按意见修改" or "重置当前候选的修改"))
-                control.IsEnabled = !_thirdBusy && !session.IsDemo;
-        }
-        var extraction = session.Extraction;
-        _thirdEvidence.Text = $"提取称呼：{extraction.Name ?? "无法确定"} · 判断类型：{extraction.Basis}\n依据：{extraction.Evidence ?? "无清晰依据"}\n" +
-            (session.Candidates.Count > 0 ? $"本次使用：{(session.Neutral ? "不带称呼" : session.ResolvedAddress)}\n" : "") +
-            $"场景：{session.Settings.Scene} · 实际模型请求：{session.ApiCallCount}";
-        _thirdUnknown!.Visibility = extraction.Name is null && session.Candidates.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
-        _thirdCandidates!.Children.Clear();
-        for (var i = 0; i < session.Candidates.Count; i++)
-        {
-            var index = i;
-            var select = Ui.Button(($"{(i == _thirdSelected ? "✓ " : "")}选择候选 {i + 1}"), () =>
+        if (_thirdEvidence is null || _thirdCandidates is null || _thirdUnknown is null) return;
+        var run = _thirdRun; var session = run?.Session; var busy = IsTaskBusy;
+        var generated = session?.Candidates.Count == 3;
+        var selected = generated && run!.SelectedIndex is >= 0 and < 3;
+        var editable = run?.Record.AppendAttemptId is null;
+        _thirdUnknown.Visibility = session is not null && !generated && session.Extraction.Name is null && session.Contact is not { Confirmed: true }
+            ? Visibility.Visible : Visibility.Collapsed;
+        _thirdEvidence.Text = session is null ? "点击上方“生成祝福”，自动截图并提取称呼，不需要导入图片。" :
+            $"称呼：{session.Extraction.Name ?? "无法确定"} · 判断：{session.Extraction.Basis}\n依据：{session.Extraction.Evidence ?? "无清晰依据"}\n" +
+            $"本次场景：{session.Settings.Scene} · 已采集 {run!.Record.CaptureCount} 张 · 上滚 {run.Record.ScrollCount} 次 · 实际模型请求 {run.Record.ApiCallCount} 次";
+        _thirdCandidates.Children.Clear();
+        if (session is not null)
+            for (var i = 0; i < session.Candidates.Count; i++)
             {
-                if (_thirdBusy) return;
-                _thirdSelected = index; ThirdSaveSelection(); ThirdRender();
-            }); select.IsEnabled = !_thirdBusy;
-            var body = Ui.Text(session.Candidates[i], 14); body.IsTextSelectionEnabled = true;
-            _thirdCandidates.Children.Add(Ui.Card(Ui.Stack(8, select, body), i == _thirdSelected ? "F0F7F1" : "FFFFFF", 14));
-        }
-        _thirdCurrent!.Text = ThirdCurrentText() is { Length: > 0 } text ? text : "请选择如何处理称呼，再生成候选。";
-        if (session.Revisions.Count > _thirdSelected)
-        {
-            var revision = session.Revisions[_thirdSelected];
-            _thirdTurns!.Text = (revision.Note.Length > 0 ? "说明：" + revision.Note + "\n\n" : "") +
-                (revision.Turns.Count == 0 ? "当前候选还没有修改记录。" : string.Join("\n\n", revision.Turns.Select((turn, index) =>
-                    $"第 {index + 1} 轮 · {turn.Instruction}\n{turn.Greeting}" + (turn.Note.Length > 0 ? "\n说明：" + turn.Note : ""))));
-        }
-        else _thirdTurns!.Text = "当前候选还没有修改记录。";
+                var index = i;
+                var button = Ui.Button((run!.SelectedIndex == i ? "✓ " : "") + $"选择候选 {i + 1}", () => ThirdSyncAction(() => ThirdWorkflow.Select(RequireThirdRun(), index)));
+                button.IsEnabled = !busy && editable;
+                var body = Ui.Text(session.Revisions[i].Greeting, 14); body.IsTextSelectionEnabled = true;
+                _thirdCandidates.Children.Add(Ui.Card(Ui.Stack(8, button, body), run.SelectedIndex == i ? "E3F0E5" : "FFFFFF", 14));
+            }
+        _thirdCurrent!.Text = selected ? ThirdSelectedText() : generated ? "三个候选已生成，请明确选择其中一条。" : "生成后请先选择一条候选，再修改、复制或预填。";
+        _thirdTurns!.Text = selected ? string.Join("\n\n", session!.Revisions[run!.SelectedIndex].Turns.Select((turn, i) =>
+            $"第 {i + 1} 轮 · {turn.Instruction}\n{turn.Greeting}" + (turn.Note.Length > 0 ? "\n说明：" + turn.Note : ""))) : "";
+        if (selected && _thirdTurns.Text.Length == 0) _thirdTurns.Text = "当前候选还没有修改记录。";
+        _thirdState!.Text = run is null ? "尚未生成。" : run.Record.FillStatus + (run.Record.Error.Length > 0 ? " · " + run.Record.Error : "") +
+            (run.IsReleased ? "\n本次采集检查已结束，仅可复制。再次预填请重新生成。" : $"\n预填检查最迟于 {run.ExpiresAt.ToLocalTime():HH:mm:ss} 结束；会话或草稿变化会提前停止。");
+        _thirdResolve!.IsEnabled = _thirdNeutral!.IsEnabled = !busy && !generated;
+        _thirdRegenerate!.IsEnabled = !busy && generated && editable;
+        _thirdRetry!.IsEnabled = !busy && session is not null && !generated && (session.Extraction.Name is not null || session.Contact is { Confirmed: true });
+        _thirdRevise!.IsEnabled = _thirdReset!.IsEnabled = !busy && selected && editable;
+        _thirdCopy!.IsEnabled = !busy && selected;
+        _thirdAppend!.IsEnabled = !busy && selected && run!.CanAppend;
+    }
+
+    private void StartThirdExpiryTimer()
+    {
+        _thirdExpiryTimer ??= new DispatcherTimer { Interval = TimeSpan.FromSeconds(5) };
+        _thirdExpiryTimer.Tick -= ThirdExpiryTick;
+        _thirdExpiryTimer.Tick += ThirdExpiryTick;
+        _thirdExpiryTimer.Start();
+    }
+
+    private async void ThirdExpiryTick(object? sender, object e)
+    {
+        if (IsTaskBusy || _thirdRun is not { IsReleased: false } run) return;
+        if (DateTimeOffset.UtcNow < run.ExpiresAt) return;
+        _thirdExpiryTimer?.Stop();
+        try { await ThirdWorkflow.ReleaseAsync(run); ThirdRenderHome(); }
+        catch (Exception error) { Notify("结束本次会话检查失败：" + error.Message, InfoBarSeverity.Warning); }
+    }
+
+    private async Task ReleaseThirdRunAsync()
+    {
+        _thirdExpiryTimer?.Stop();
+        if (_thirdRun is { } run && _thirdWorkflow is not null) await _thirdWorkflow.ReleaseAsync(run);
     }
 }

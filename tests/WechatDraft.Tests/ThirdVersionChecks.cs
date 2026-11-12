@@ -20,6 +20,85 @@ internal static class ThirdVersionChecks
 
     public static IEnumerable<(string Name, Func<Task> Run)> Cases(string root)
     {
+        yield return ("Prompt example editor saves the exact text used by the next generation and regeneration", async () =>
+        {
+            using var fixture = new Fixture(root, (call, _, _) => Task.FromResult(Reply(call switch { 1 => Direct(), 2 => Candidates(), _ => Candidates(3) })));
+            var session = await fixture.ExtractAsync();
+            var original = ThirdVersionExamples.Load(fixture.PromptDirectory);
+            var first = "输入：周老师春节。输出：这是编辑页面保存的第一组独特风格示例，请自然表达祝愿。";
+            ThirdVersionExamples.Save(fixture.PromptDirectory, first, original);
+            Equal(first, ThirdVersionExamples.Load(fixture.PromptDirectory));
+            await fixture.Service.GenerateAsync(session, null, false, default);
+            True(fixture.Handler.Bodies[1].Contains(first), "Generation did not use saved examples.");
+            var second = "输入：李老师春节。输出：这是再次保存的第二组示例，表达简洁真诚，不编造经历。";
+            ThirdVersionExamples.Save(fixture.PromptDirectory, second, first);
+            await fixture.Service.RegenerateAsync(session, default);
+            True(fixture.Handler.Bodies[2].Contains(second) && !fixture.Handler.Bodies[2].Contains(first), "Regeneration retained stale examples.");
+        });
+        yield return ("Prompt example editor rejects invalid content without overwriting the current file", async () =>
+        {
+            using var fixture = new Fixture(root, (_, _, _) => throw new Exception("Unexpected HTTP"));
+            var original = ThirdVersionExamples.Load(fixture.PromptDirectory);
+            foreach (var text in new[] { "太短", new string('中', 50000), new string('a', 25) + '\0' })
+            {
+                await RejectAsync(() => { ThirdVersionExamples.Save(fixture.PromptDirectory, text, original); return Task.CompletedTask; });
+                Equal(original, ThirdVersionExamples.Load(fixture.PromptDirectory));
+            }
+            Equal(0, fixture.Handler.Calls);
+        });
+        yield return ("Prompt example editor detects external changes and never silently overwrites them", async () =>
+        {
+            using var fixture = new Fixture(root, (_, _, _) => throw new Exception("Unexpected HTTP"));
+            var original = ThirdVersionExamples.Load(fixture.PromptDirectory);
+            var external = "其他编辑器已经保存了这段新的提示词示例，请保留这些外部编辑内容不要覆盖。";
+            ThirdVersionExamples.Save(fixture.PromptDirectory, external, original);
+            await RejectAsync(() => { ThirdVersionExamples.Save(fixture.PromptDirectory, original + "编辑", original); return Task.CompletedTask; });
+            Equal(external, ThirdVersionExamples.Load(fixture.PromptDirectory));
+        });
+        yield return ("Prompt example list imports all eleven original pairs and preserves disabled items", () =>
+        {
+            using var fixture = new Fixture(root, (_, _, _) => throw new Exception("Unexpected HTTP"));
+            var library = ThirdVersionExampleLibrary.Load(fixture.PromptDirectory);
+            Equal(11, library.Examples.Count);
+            var items = library.Examples.Select((x, i) => i == 0 ? x with { Enabled = false } : x).ToArray();
+            var saved = ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, items, library.Version);
+            Equal(11, ThirdVersionExampleLibrary.Load(fixture.PromptDirectory).Examples.Count);
+            var prompt = ThirdVersionExamples.Load(fixture.PromptDirectory);
+            True(!prompt.Contains(items[0].Output), "Disabled example entered prompt.");
+            True(items.Skip(1).All(x => prompt.Contains(x.Output)), "Enabled examples were filtered or capped at three.");
+            ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [], saved.Version);
+            True(ThirdVersionExamples.Load(fixture.PromptDirectory).Contains("没有启用"), "Empty list should be valid.");
+            return Task.CompletedTask;
+        });
+        yield return ("Prompt example list edits reach generation and regeneration but not disabled examples", async () =>
+        {
+            using var fixture = new Fixture(root, (call, _, _) => Task.FromResult(Reply(call switch { 1 => Direct(), 2 => Candidates(), _ => Candidates(3) })));
+            var session = await fixture.ExtractAsync();
+            var library = ThirdVersionExampleLibrary.Load(fixture.PromptDirectory);
+            var first = new PromptExample("custom", "本次输入参考", "逐条保存的独特示例第一版");
+            var disabled = new PromptExample("disabled", "停用输入", "这条停用输出绝不能进入生成请求", false);
+            library = ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [first, disabled], library.Version);
+            await fixture.Service.GenerateAsync(session, null, false, default);
+            True(fixture.Handler.Bodies[1].Contains(first.Output) && !fixture.Handler.Bodies[1].Contains(disabled.Output), "Wrong active example payload.");
+            var edited = first with { Output = "逐条保存的独特示例第二版" };
+            ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [edited, disabled], library.Version);
+            await fixture.Service.RegenerateAsync(session, default);
+            True(fixture.Handler.Bodies[2].Contains(edited.Output) && !fixture.Handler.Bodies[2].Contains(first.Output), "List edit did not reload.");
+        });
+        yield return ("Prompt example list backs up prior values and rejects stale or invalid edits", async () =>
+        {
+            using var fixture = new Fixture(root, (_, _, _) => throw new Exception("Unexpected HTTP"));
+            var originalText = ThirdVersionExamples.Load(fixture.PromptDirectory);
+            var library = ThirdVersionExampleLibrary.Load(fixture.PromptDirectory);
+            var saved = ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, library.Examples, library.Version);
+            await RejectAsync(() => { ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [], library.Version); return Task.CompletedTask; });
+            await RejectAsync(() => { ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [new("bad", "", "")], saved.Version); return Task.CompletedTask; });
+            ThirdVersionExampleLibrary.Save(fixture.PromptDirectory, [], saved.Version);
+            var backups = Directory.GetFiles(Path.Combine(fixture.PromptDirectory, "example-backups"));
+            Equal(2, backups.Length);
+            True(backups.Any(x => File.ReadAllText(x) == originalText), "Original text backup lost.");
+            True(backups.Any(x => File.ReadAllText(x) == saved.Version), "Prior list backup lost.");
+        });
         yield return ("Third version unknown extraction pauses until the user resolves an address", async () =>
         {
             using var fixture = new Fixture(root, (_, _, _) => Task.FromResult(Reply(Unknown())));

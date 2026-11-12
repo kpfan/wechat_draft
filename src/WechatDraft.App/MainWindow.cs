@@ -55,8 +55,7 @@ public sealed partial class MainWindow : Window
 
     public MainWindow()
     {
-        Title = Environment.GetEnvironmentVariable("WECHAT_DRAFT_THIRD_VERSION") == "1"
-            ? "祝语 · 第三版本地实验" : "祝语 · 微信草稿助手";
+        Title = "祝语 · 微信草稿助手";
         _dataDirectory = Environment.GetEnvironmentVariable("WECHAT_DRAFT_DATA") ?? Path.Combine(AppContext.BaseDirectory, "data");
         _repository = new LocalRepository(_dataDirectory, _protector);
         _settings = _repository.LoadSettings();
@@ -76,15 +75,19 @@ public sealed partial class MainWindow : Window
         _root.Children.Add(BuildSidebar()); Grid.SetColumn(_page, 1); _root.Children.Add(_page);
         Content = _root;
         ConfigureWindowLayout();
-        if (Environment.GetEnvironmentVariable("WECHAT_DRAFT_THIRD_VERSION") == "1") ShowThirdVersion();
-        else ShowHome();
+        ShowHome();
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _hotkey = new GlobalHotkey(hwnd);
         _hotkey.Pressed += () => DispatcherQueue.TryEnqueue(() => { if (!_paused) _ = StartTaskAsync(); });
         if (!_hotkey.Register(_settings.HotkeyVirtualKey)) _footer.Text = "快捷键冲突，请到设置修改";
         SetupTray();
         ConfigureWindowRefresh();
-        Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); _thirdService?.Dispose(); };
+        Closed += async (_, _) =>
+        {
+            _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording();
+            _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose();
+            try { await ReleaseThirdRunAsync(); } finally { _thirdService?.Dispose(); }
+        };
     }
 
     private void SeedDemoContacts()
@@ -107,11 +110,10 @@ public sealed partial class MainWindow : Window
         logo.Margin = new Thickness(4, 14, 0, 10);
         var menu = Ui.Stack(9);
         AddNavigation(menu, "✦   生成祝福", ShowHome);
-        AddNavigation(menu, "◇   第三版实验", ShowThirdVersion);
         AddNavigation(menu, "◷   历史记录", ShowHistory);
         AddNavigation(menu, "✓   已发送祝福", ShowSentGreetings);
         AddNavigation(menu, "♧   联系人档案", ShowContacts);
-        AddNavigation(menu, "▤   祝福范例", ShowExamples);
+        AddNavigation(menu, "▤   提示词示例", ShowExamples);
         AddNavigation(menu, "⚡   API 管理", ShowApiProfiles);
         AddNavigation(menu, "⚙   设置", ShowSettings);
         var message = Ui.Card(Ui.Stack(7, Ui.Text("把心意写得恰到好处", 12, "42715F", true), Ui.Text("生成草稿，由你检查和发送。", 11, "70877D")), "EDF5EF", 14);
@@ -177,12 +179,18 @@ public sealed partial class MainWindow : Window
         var header = Ui.Stack(8, Ui.Badge("为每一份关系，留一点用心"), Ui.Text("一句祝福，刚刚好。", 30, bold: true),
             Ui.Text("选好场景，打开聊天，让合适的心意落在输入框里。", 14, "73817A"));
         _mode = new ToggleSwitch { Header = "当前工作模式", OffContent = "真实微信", OnContent = "演示模式 · 无 API 调用", IsOn = _settings.DemoMode };
-        _mode.Toggled += (_, _) => { if (_coordinator.IsRunning) return; StopSentRecording(); _settings.DemoMode = _mode.IsOn; _repository.SaveSettings(_settings); ShowHome(); };
+        _mode.Toggled += async (_, _) =>
+        {
+            if (IsTaskBusy) return;
+            StopSentRecording();
+            _settings.DemoMode = _mode.IsOn; _repository.SaveSettings(_settings);
+            await ReleaseThirdRunAsync(); ShowHome();
+        };
         _scene = Ui.Combo("祝福场景", ["春节", "元旦", "中秋", "端午", "生日", "纪念日", "通用问候"], _settings.Scene);
         _scene.IsEditable = true; _scene.Text = _settings.Scene;
         _extra = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：给老师，朴素一点；加 1–2 个 Emoji"); _extra.MaxLength = 300;
         _extra.AcceptsReturn = true; _extra.Height = 86;
-        _startButton = Ui.Button(_settings.DemoMode || _settings.EnableLiveAppend ? "✦  生成并预填草稿" : "✦  生成祝福", () => _ = StartTaskAsync(), true);
+        _startButton = Ui.Button(_settings.DemoMode ? "✦  生成并预填草稿" : "✦  生成三个祝福候选", () => _ = StartTaskAsync(), true);
         _startButton.HorizontalAlignment = HorizontalAlignment.Stretch;
         _cancelButton = Ui.Button("取消任务", () => _runCancellation?.Cancel()); _cancelButton.IsEnabled = false;
         _progressTitle = Ui.Text("准备就绪", 13, "416A56", true);
@@ -220,7 +228,7 @@ public sealed partial class MainWindow : Window
                 _visionPreview,
                 Ui.Text("黄框：本地图标；蓝框：聊天与标题；绿框：消息；紫框：输入面板；橙框：编辑区估算；红框：发送区域估算。仅预览，不点击或填写。", 12, "71817B")));
             _visionPreviewCard.Visibility = Visibility.Collapsed;
-            body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, resultCard, BuildSentRecordingControls());
+            body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, BuildThirdVersionResult(), BuildSentRecordingControls());
         }
         _notice = new InfoBar { IsOpen = false, IsClosable = true };
         _runningHomeView = Present(Ui.Stack(22, header, _notice, body));
@@ -255,7 +263,7 @@ public sealed partial class MainWindow : Window
 
     private async Task StartTaskAsync()
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
+        if (IsTaskBusy) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
         if (!_homeVisible || _scene is null) ShowHome();
         _settings.Scene = _scene!.Text.Trim();
         _settings.ExtraInstruction = _extra?.Text.Trim() ?? "";
@@ -275,7 +283,8 @@ public sealed partial class MainWindow : Window
         {
             RefreshWindows();
             if (_windows?.SelectedItem is not WechatWindow window) { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
-            adapter = CreateConversationAdapter(window.Handle, taskSettings);
+            await StartThirdVersionTaskAsync(taskSettings, window);
+            return;
         }
         _runCancellation = new CancellationTokenSource(); SetBusy(true);
         try
@@ -303,7 +312,7 @@ public sealed partial class MainWindow : Window
 
     private async Task CheckWechatAsync()
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) return;
+        if (IsTaskBusy) return;
         RefreshWindows();
         if (_windows?.SelectedItem is not WechatWindow window)
         { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
@@ -345,7 +354,7 @@ public sealed partial class MainWindow : Window
 
     private async Task CheckVisionAsync()
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) return;
+        if (IsTaskBusy) return;
         RefreshWindows();
         if (_windows?.SelectedItem is not WechatWindow window)
         { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
@@ -409,6 +418,8 @@ public sealed partial class MainWindow : Window
         _historyView?.SetTaskBusy(busy);
         if (!busy) _taskFinishedElsewhere = !_homeVisible;
         RefreshSidebarTask();
+        ThirdSetBusy(busy);
+        if (!busy) ThirdRenderHome();
         if (!busy)
         {
             var refreshHome = _homeVisible && _homeSettingsAtTaskStart is not null && _homeSettingsAtTaskStart != _settings;

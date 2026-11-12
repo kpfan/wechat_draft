@@ -19,7 +19,7 @@ internal sealed record ThirdVersionPrompts(string Extract, string Generate, stri
             if (text.Length < minimum || text.Contains('\0')) throw new InvalidDataException($"第三版配置内容无效或过短：{name}。");
             return text;
         }
-        var result = new ThirdVersionPrompts(Read("extract.txt", 100), Read("generate.txt", 100), Read("revise.txt", 100), Read("examples.txt", 20));
+        var result = new ThirdVersionPrompts(Read("extract.txt", 100), Read("generate.txt", 100), Read("revise.txt", 100), ThirdVersionExamples.Load(directory).Trim());
         if (!result.Extract.Contains("direct") || !result.Extract.Contains("inferred") || !result.Extract.Contains("unknown"))
             throw new InvalidDataException("第三版提取配置缺少 direct / inferred / unknown 输出约定。");
         if (!result.Generate.Contains("candidates") || !result.Revise.Contains("greeting") || !result.Revise.Contains("note"))

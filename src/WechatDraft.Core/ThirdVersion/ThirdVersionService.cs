@@ -16,6 +16,8 @@ public sealed class ThirdVersionService : IDisposable
     private readonly string _promptDirectory;
     private readonly Guid _owner = Guid.NewGuid();
     private readonly HttpClient _http;
+    private int _apiCallCount;
+    public int ApiCallCount => Volatile.Read(ref _apiCallCount);
     private readonly SemaphoreSlim _requests = new(1, 1);
     private DateTimeOffset _notBefore;
     private static readonly JsonSerializerOptions Json = new(JsonDefaults.Options)
@@ -275,6 +277,7 @@ public sealed class ThirdVersionService : IDisposable
         {
             timeout.Token.ThrowIfCancellationRequested();
             Interlocked.Increment(ref session.CallCount);
+            Interlocked.Increment(ref _apiCallCount);
             response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
         }
         catch (HttpRequestException) { throw new ThirdVersionRetryException("第三版网络请求失败，请检查连接。"); }

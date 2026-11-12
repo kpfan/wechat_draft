@@ -9,7 +9,7 @@ public sealed partial class MainWindow
 
     private UIElement BuildPrefillOption()
     {
-        _prefill = new CheckBox { Content = "生成后预填到微信输入框", IsChecked = _settings.EnableLiveAppend };
+        _prefill = new CheckBox { Content = "允许选中候选后预填到微信输入框", IsChecked = _settings.EnableLiveAppend };
         _prefillHelp = Ui.Text(PrefillHint(), 12, "8D713D");
         _prefill.Checked += (_, _) => SavePrefillPreference();
         _prefill.Unchecked += (_, _) => SavePrefillPreference();
@@ -17,8 +17,8 @@ public sealed partial class MainWindow
     }
 
     private string PrefillHint() => _settings.EnableLiveAppend
-        ? "生成期间可以浏览本软件。填写时需回到原微信聊天，最多等待 30 秒，不抢占窗口；切换聊天、修改微信草稿或转到其他程序会停止预填。同一聊天且草稿未变化后在末尾追加，不会自动发送。"
-        : "只生成祝福，结果显示在助手中。开启后仅对新任务生效。";
+        ? "生成三个候选后，选择要使用的一条，再点“预填当前选中正文”。沿用开始时的聊天及完整草稿检查，最多保留 10 分钟；聊天、草稿或窗口变化后停止预填，不会自动发送。"
+        : "只生成三个候选，可选择、修改和复制。开启预填仅对重新开始的任务生效。";
 
     private void SavePrefillPreference()
     {
@@ -38,6 +38,6 @@ public sealed partial class MainWindow
             Notify("预填选项未能保存：" + e.Message, InfoBarSeverity.Warning);
         }
         if (_prefillHelp is not null) _prefillHelp.Text = PrefillHint();
-        if (_startButton is not null) _startButton.Content = _settings.EnableLiveAppend ? "✦  生成并预填草稿" : "✦  生成祝福";
+        if (_startButton is not null) _startButton.Content = _settings.DemoMode ? "✦  生成并预填草稿" : "✦  生成三个祝福候选";
     }
 }

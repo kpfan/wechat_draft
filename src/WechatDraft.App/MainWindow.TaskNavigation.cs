@@ -16,7 +16,7 @@ public sealed partial class MainWindow
     private Button? _sidebarCancel;
     private bool _taskFinishedElsewhere;
     private readonly List<Button> _idleActions = [];
-    private bool IsTaskBusy => _runCancellation is not null || _coordinator.IsRunning;
+    private bool IsTaskBusy => _runCancellation is not null || _coordinator.IsRunning || _thirdWorkflow?.IsRunning == true;
 
     private void Navigate(Action navigate)
     {

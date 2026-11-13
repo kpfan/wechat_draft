@@ -19,6 +19,8 @@
 **/debug/
 **/logs/
 **/screenshots/
+**/example-backups/
+**/examples-library.json
 *.db
 *.db-shm
 *.db-wal

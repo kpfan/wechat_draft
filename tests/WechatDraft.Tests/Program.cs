@@ -92,6 +92,8 @@ foreach (var (name, run) in VisionClipboardPollerChecks.Cases()) await Test(name
 foreach (var (name, run) in VisionInputSettlerChecks.Cases()) await Test(name, run);
 foreach (var (name, run) in VisionCurrentDraftChecks.Cases(root)) await Test(name, run);
 foreach (var (name, run) in OcrPrefillChecks.Cases(root, examples, protector)) await Test(name, run);
+foreach (var (name, run) in ThirdVersionChecks.Cases(root)) await Test(name, run);
+foreach (var (name, run) in ThirdVersionWorkflowChecks.Cases(root, protector)) await Test(name, run);
 await Test("Generation keeps past greetings local and accepts a matching response without retry", async () =>
 {
     const string greeting = "陈老师，生日快乐！愿您在新的一岁里平安顺遂，每天都有值得期待的小事。";

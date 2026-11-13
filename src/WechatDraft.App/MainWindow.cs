@@ -97,7 +97,7 @@ public sealed partial class MainWindow : Window
         UpdateHotkeyFooter();
         SetupTray();
         ConfigureWindowRefresh();
-        Closed += (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
+        Closed += async (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); await ReleaseThirdRunAsync(); _thirdService?.Dispose(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
     }
 
     private Border BuildSidebar()
@@ -112,7 +112,7 @@ public sealed partial class MainWindow : Window
         AddNavigation(menu, "◷   历史记录", ShowHistory);
         AddNavigation(menu, "✓   已发送祝福", ShowSentGreetings);
         AddNavigation(menu, "♧   联系人档案", ShowContacts);
-        AddNavigation(menu, "▤   祝福范例", ShowExamples);
+        AddNavigation(menu, "▤   提示词示例", ShowExamples);
         AddNavigation(menu, "⚡   API 管理", ShowApiProfiles);
         AddNavigation(menu, "⚙   设置", ShowSettings);
         var message = Ui.Card(Ui.Stack(7, Ui.Text("把心意写得恰到好处", 12, "42715F", true), Ui.Text("生成草稿，由你检查和发送。", 11, "70877D")), "EDF5EF", 14);
@@ -186,7 +186,7 @@ public sealed partial class MainWindow : Window
         _scene.IsEditable = true; _scene.Text = _settings.Scene;
         _zodiac = BuildZodiacSelector(_scene);
         var extraEditor = BuildExtraInstructionEditor();
-        _startButton = Ui.Button(_settings.EnableLiveAppend ? "✦  生成并预填草稿" : "✦  生成祝福", () => _ = StartTaskAsync(), true);
+        _startButton = Ui.Button("✦  生成三个祝福候选", () => _ = StartTaskAsync(), true);
         _startButton.HorizontalAlignment = HorizontalAlignment.Stretch;
         _cancelButton = Ui.Button("取消任务", () => _runCancellation?.Cancel()); _cancelButton.IsEnabled = false;
         _progressTitle = Ui.Text("准备就绪", 13, "416A56", true);
@@ -195,7 +195,7 @@ public sealed partial class MainWindow : Window
         _forceGenerateButton = Ui.Button("强制生成", () => _ = StartTaskAsync(forceGeneration: true));
         var form = Ui.Stack(14, Ui.Text("生成一条合适的祝福", 19, bold: true), target,
             _scene, _zodiac, extraEditor, BuildPrefillOption(), Columns(_startButton, _cancelButton, 3, 1),
-            Ui.Stack(6, _forceGenerateButton, Ui.Text("跳过会话核对，生成后追加到所选微信窗口当时打开的聊天。", 12, "8D713D")),
+            Ui.Stack(6, _forceGenerateButton, Ui.Text("跳过本地会话核对并生成三个候选。未核对身份的结果仅供复制，不自动预填；模型仍遵守第三版称呼与单聊规则。", 12, "8D713D")),
             Ui.Stack(7, _progressTitle, _progressDetail, _progressBar));
         _resultText = Ui.Text(_latest?.Greeting is { Length: > 0 } result ? result : "生成后，祝福正文会显示在这里。", 16, "385347");
         _resultText.IsTextSelectionEnabled = true; _resultText.LineHeight = 29;
@@ -209,7 +209,7 @@ public sealed partial class MainWindow : Window
             _visionPreview,
             Ui.Text("黄框：本地图标；蓝框：聊天与标题；绿框：消息；紫框：输入面板；橙框：编辑区估算；红框：发送区域估算。仅预览，不点击或填写。", 12, "71817B")));
         _visionPreviewCard.Visibility = Visibility.Collapsed;
-        var body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, resultCard, BuildSentRecordingControls());
+        var body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, BuildThirdVersionResult(), BuildSentRecordingControls());
         _notice = new InfoBar { IsOpen = false, IsClosable = true };
         _runningHomeView = Present(Ui.Stack(22, header, _notice, body));
         if (_lastTaskProgress is { } progress) ShowProgress(progress.Stage, progress.Detail, progress.Percent);
@@ -263,7 +263,7 @@ public sealed partial class MainWindow : Window
 
     private async Task StartTaskAsync(bool forceGeneration = false)
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
+        if (IsTaskBusy) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
         if (!_homeVisible || _scene is null) ShowHome();
         _settings.Scene = _scene!.Text.Trim();
         _settings.ExtraInstruction = _extra?.Text.Trim() ?? "";
@@ -272,34 +272,12 @@ public sealed partial class MainWindow : Window
         if (_windows?.SelectedItem is not WechatWindow window) { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
         if (!await ConfirmScreenshotUploadAsync() || IsTaskBusy) return;
         var taskSettings = _settings with { };
-        var adapter = forceGeneration ? CreateVisionAdapter(window.Handle, enableAppend: true, forceGeneration: true)
-            : CreateConversationAdapter(window.Handle, taskSettings);
-        _runCancellation = new CancellationTokenSource(); SetBusy(true);
-        try
-        {
-            var result = await _coordinator.RunAsync(taskSettings, adapter, _client, _runCancellation.Token);
-            if (result is null) return; _latest = result;
-            if (_resultText is not null) _resultText.Text = string.IsNullOrWhiteSpace(result.Greeting) ? "本次没有生成正文。" : result.Greeting;
-            if (_resultStatus is not null) _resultStatus.Text = result.FillStatus;
-            var detail = result.Error.Length > 0 ? result.Error : "请检查草稿并手动发送。";
-            Notify(result.FillStatus + " · " + detail, result.FillStatus == "已预填" ? InfoBarSeverity.Success : InfoBarSeverity.Warning);
-            _tray!.Text = "祝语 · " + taskSettings.Scene;
-        }
-        catch (Exception e)
-        {
-            ShowProgress("处理失败", e.Message, 100);
-            Notify("处理未完成：" + e.Message, InfoBarSeverity.Error);
-        }
-        finally
-        {
-            if (adapter is IDisposable disposable) disposable.Dispose();
-            _runCancellation?.Dispose(); _runCancellation = null; SetBusy(false);
-        }
+        await StartThirdVersionTaskAsync(taskSettings, window, forceGeneration);
     }
 
     private async Task CheckWechatAsync()
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) return;
+        if (IsTaskBusy) return;
         RefreshWindows();
         if (_windows?.SelectedItem is not WechatWindow window)
         { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
@@ -342,7 +320,7 @@ public sealed partial class MainWindow : Window
 
     private async Task CheckVisionAsync()
     {
-        if (_coordinator.IsRunning || _runCancellation is not null) return;
+        if (IsTaskBusy) return;
         RefreshWindows();
         if (_windows?.SelectedItem is not WechatWindow window)
         { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }

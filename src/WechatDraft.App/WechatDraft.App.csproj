@@ -21,5 +21,6 @@
     <ProjectReference Include="../WechatDraft.Core/WechatDraft.Core.csproj" />
     <ProjectReference Include="../WechatDraft.Windows/WechatDraft.Windows.csproj" />
     <Content Include="../../config/blessing_examples.json" Link="config/blessing_examples.json" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="../../config/third-version/**/*" Exclude="../../config/third-version/**/examples-library.json;../../config/third-version/**/example-backups/**/*" Link="config/third-version/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

@@ -207,6 +207,46 @@ internal static class ThirdVersionChecks
             True(!fixture.Handler.Bodies[1].Contains("外部篡改") && !fixture.Handler.Bodies[1].Contains("通过 getter"), "Mutation entered the next request.");
             Equal(2, session.ApiCallCount);
         });
+        yield return ("Third version passes selected holiday zodiac through extraction generation and revision as data but omits it for ordinary scenes", async () =>
+        {
+            foreach (var (scene, year, expected) in new (string Scene, string Year, string? Expected)[]
+                { ("春节", "龙年", "龙年"), ("元旦", "蛇年", "蛇年"), ("生日", "虎年", null) })
+            {
+                string SceneGreeting(int index) => Greeting(index).Replace("春节", scene, StringComparison.Ordinal)
+                    .Replace("新春", scene, StringComparison.Ordinal).Replace("新年", scene, StringComparison.Ordinal)
+                    .Replace("过年", scene, StringComparison.Ordinal);
+                using var fixture = new Fixture(root, (call, body, _) =>
+                {
+                    using var request = JsonDocument.Parse(body);
+                    var user = request.RootElement.GetProperty("messages")[1].GetProperty("content");
+                    var data = call switch
+                    {
+                        1 => user[0].GetProperty("text").GetString()!,
+                        2 => user.GetString()!.Split("\n本次输入：\n", StringSplitOptions.None)[1],
+                        _ => user.GetString()!.Split('\n')[0]
+                    };
+                    using var payload = JsonDocument.Parse(data);
+                    Equal(scene, payload.RootElement.GetProperty("festival").GetString());
+                    var zodiac = payload.RootElement.GetProperty("zodiac_year");
+                    if (expected is null) Equal(JsonValueKind.Null, zodiac.ValueKind);
+                    else Equal(expected, zodiac.GetString());
+                    var response = call switch
+                    {
+                        1 => Direct(),
+                        2 => JsonSerializer.Serialize(new { candidates = Enumerable.Range(0, 3).Select(SceneGreeting) }),
+                        _ => JsonSerializer.Serialize(new { greeting = SceneGreeting(3), note = "" })
+                    };
+                    return Task.FromResult(Reply(response));
+                });
+                var settings = Settings() with { Scene = scene, ZodiacYear = year };
+                var session = await fixture.ExtractAsync(settings);
+                settings.ZodiacYear = "猪年"; // Later settings edits must not change this session's selected zodiac.
+                await fixture.Service.GenerateAsync(session, null, false, default);
+                await fixture.Service.ReviseAsync(session, 0, "保留称呼，调整表达语气", default);
+                Equal(3, fixture.Handler.Calls); Equal(3, session.ApiCallCount);
+                Equal(1, session.Revisions[0].Turns.Count);
+            }
+        });
         yield return ("Third version multi-turn revisions isolate branches and reset locally to immutable originals", async () =>
         {
             using var fixture = new Fixture(root, (call, _, _) => Task.FromResult(Reply(call switch
@@ -343,7 +383,7 @@ internal static class ThirdVersionChecks
         });
     }
 
-    private static AppSettings Settings() => new() { DemoMode = false, Scene = "春节", Model = "offline-test-model",
+    private static AppSettings Settings() => new() { Scene = "春节", Model = "offline-test-model",
         BaseUrl = "https://third-version.invalid/v1", AuthorizedOrigin = "https://third-version.invalid", RequestTimeoutSeconds = 5, TaskTimeoutSeconds = 15 };
     private static string Greeting(int index, string? address = "周老师") => (string.IsNullOrEmpty(address) ? "" : address + "，") + Texts[index];
     private static string Candidates(int offset = 0, string? address = "周老师") => JsonSerializer.Serialize(new { candidates = Enumerable.Range(offset, 3).Select(i => Greeting(i, address)) });

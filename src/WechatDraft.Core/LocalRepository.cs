@@ -72,29 +72,6 @@ public sealed class LocalRepository
     public List<TaskRecord> History(string? scope, int limit = 200) => Read<TaskRecord>(scope is null
         ? "SELECT payload FROM tasks ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000)
         : "SELECT payload FROM tasks WHERE scope=$scope ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000), scope);
-    public IReadOnlyList<string> RecentGreetings(string scope, string? contactId, string displayName, string scene,
-        bool isDemo, CancellationToken cancellationToken = default)
-    {
-        cancellationToken.ThrowIfCancellationRequested();
-        if (string.IsNullOrWhiteSpace(displayName)) return [];
-        using var db = Open(); using var command = db.CreateCommand();
-        command.CommandText = "SELECT payload FROM tasks WHERE scope=$scope ORDER BY created DESC,id DESC LIMIT 200";
-        command.Parameters.AddWithValue("$scope", scope);
-        using var reader = command.ExecuteReader();
-        var result = new List<string>(); var seen = new HashSet<string>(StringComparer.Ordinal);
-        while (reader.Read())
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var task = Decode<TaskRecord>(reader.GetString(0));
-            var sameContact = !string.IsNullOrEmpty(contactId) && !string.IsNullOrEmpty(task.ContactId)
-                ? task.ContactId == contactId : task.DisplayName.Trim() == displayName.Trim();
-            if (!sameContact || task.IsDemo != isDemo || task.Scene.Trim() != scene.Trim() ||
-                task.GenerationStatus != "成功" || string.IsNullOrWhiteSpace(task.Greeting)) continue;
-            if (seen.Add(GreetingDiversity.Normalize(task.Greeting))) result.Add(task.Greeting);
-            if (result.Count == 5) break;
-        }
-        return result;
-    }
     public HistoryBatch ReadHistoryBatch(string scope, HistoryCursor? before, int limit, CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
@@ -135,8 +112,9 @@ public sealed class LocalRepository
         command.Parameters.AddWithValue("$p", Encode(record)); command.Parameters.AddWithValue("$id", record.Id);
         command.Parameters.AddWithValue("$scope", record.AccountScope); return command.ExecuteNonQuery() == 1;
     }
-    public List<SentGreetingRecord> SentGreetings(string scope, int limit = 200) => Read<SentGreetingRecord>(
-        "SELECT payload FROM sent_greetings WHERE scope=$scope ORDER BY created DESC LIMIT " + Math.Clamp(limit, 1, 100000), scope);
+    public List<SentGreetingRecord> SentGreetings(string scope, int limit = 200, bool includeDemo = true) => Read<SentGreetingRecord>(
+        "SELECT payload FROM sent_greetings WHERE scope=$scope ORDER BY created DESC", scope,
+        includeDemo ? null : record => !record.IsDemo, Math.Clamp(limit, 1, 100000));
     public void DeleteSentGreeting(string id) => Write("DELETE FROM sent_greetings WHERE id=$id", ("$id", id));
     public void ClearSentGreetings(string scope) => Write("DELETE FROM sent_greetings WHERE scope=$scope", ("$scope", scope));
     public void Cleanup(int retentionDays)
@@ -158,12 +136,16 @@ public sealed class LocalRepository
             task.CompletedAt = DateTimeOffset.UtcNow; SaveTask(task);
         }
     }
-    private List<T> Read<T>(string sql, string? scope)
+    private List<T> Read<T>(string sql, string? scope, Func<T, bool>? include = null, int limit = int.MaxValue)
     {
         using var db = Open(); using var command = db.CreateCommand(); command.CommandText = sql;
         if (scope is not null) command.Parameters.AddWithValue("$scope", scope);
         using var reader = command.ExecuteReader(); var result = new List<T>();
-        while (reader.Read()) result.Add(Decode<T>(reader.GetString(0)));
+        while (result.Count < limit && reader.Read())
+        {
+            var record = Decode<T>(reader.GetString(0));
+            if (include is null || include(record)) result.Add(record);
+        }
         return result;
     }
     private string Encode<T>(T value) => _protector.Protect(JsonSerializer.Serialize(value, JsonDefaults.Options));

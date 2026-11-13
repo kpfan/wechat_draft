@@ -80,7 +80,7 @@ public sealed partial class MainWindow
             Ui.Text("当前选中正文", 17, bold: true), _thirdCurrent,
             _thirdInstruction, Ui.Row(8, _thirdRevise, _thirdReset), _thirdTurns,
             Ui.Row(8, _thirdCopy, _thirdAppend), _thirdState,
-            Ui.Text("候选需由你明确选择。预填只尝试一次，保留原草稿，不发送；原聊天或草稿变化、超过 10 分钟或关闭预填时只能复制。", 12, "8D713D"),
+            Ui.Text("候选需由你明确选择。预填只尝试一次，不发送；视觉模式由上游适配器核对当前聊天并保留填写时的完整草稿，UIA 要求原稿不变。超过 10 分钟或强制生成时只能复制。", 12, "8D713D"),
             Ui.Button("打开提示词与示例目录", () => _ = OpenThirdPromptsAsync()));
         ThirdRenderHome();
         return Ui.Card(content, "F0F7F1", 22);
@@ -94,14 +94,15 @@ public sealed partial class MainWindow
 
     private ThirdVersionRun RequireThirdRun() => _thirdRun ?? throw new InvalidOperationException("请先点击生成祝福，自动采集当前微信聊天。");
 
-    private async Task StartThirdVersionTaskAsync(AppSettings settings, WechatWindow window)
+    private async Task StartThirdVersionTaskAsync(AppSettings settings, WechatWindow window, bool forceGeneration = false)
     {
         await ThirdOperateAsync(async ct =>
         {
             if (_thirdRun is not null) await ThirdWorkflow.ReleaseAsync(_thirdRun);
             _thirdRun = null;
             // The original adapter decides UIA/visual routing, foreground waits, screenshot bounds and identity checks.
-            var adapter = CreateConversationAdapter(window.Handle, settings);
+            var adapter = forceGeneration ? CreateVisionAdapter(window.Handle, enableAppend: false, forceGeneration: true)
+                : CreateConversationAdapter(window.Handle, settings);
             _thirdRun = await ThirdWorkflow.StartAsync(settings, adapter, ct);
             StartThirdExpiryTimer();
         });

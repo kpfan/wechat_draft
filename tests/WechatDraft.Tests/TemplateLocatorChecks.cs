@@ -10,10 +10,14 @@ internal static class TemplateLocatorChecks
         yield return ("Local toolbar anchors follow DPI-scaled templates within the selected frame", () =>
         {
             foreach (var dpi in new uint[] { 96, 144, 192 })
+            foreach (var theme in new[] { WechatToolbarTheme.Dark, WechatToolbarTheme.Light })
             {
-                using var frame = Fixture(dpi, false);
-                var result = WechatTemplateLocator.Locate(frame, dpi, default)
+                using var frame = Fixture(dpi, false, theme);
+                var preferred = theme == WechatToolbarTheme.Light ? WechatToolbarTheme.Dark : WechatToolbarTheme.Light;
+                var match = WechatTemplateLocator.Locate(frame, dpi, default, preferred, _ => true)
                     ?? throw new Exception("Known templates were not located at DPI " + dpi);
+                var result = match.Anchors;
+                if (match.Theme != theme) throw new Exception("The opposite theme was accepted.");
                 if (result.TopScore < 0.80 || result.BottomScore < 0.80 || result.Scale != dpi / 192d)
                     throw new Exception("DPI scale or confidence was not preserved.");
                 Near(700, result.TopToolbar.X * frame.Width / 1000);
@@ -60,26 +64,30 @@ internal static class TemplateLocatorChecks
         });
     }
 
-    internal static Bitmap Fixture(uint dpi, bool duplicate)
+    internal static Bitmap Fixture(uint dpi, bool duplicate, WechatToolbarTheme theme = WechatToolbarTheme.Dark,
+        int width = 1100, int topX = 700, int bottomX = 350)
     {
-        var result = new Bitmap(1100, 800, PixelFormat.Format32bppArgb); result.SetResolution(96, 96);
+        var result = new Bitmap(width, 800, PixelFormat.Format32bppArgb); result.SetResolution(96, 96);
         using var graphics = Graphics.FromImage(result);
-        graphics.Clear(Color.FromArgb(31, 31, 31));
+        var light = theme == WechatToolbarTheme.Light;
+        var scale = dpi / 192d;
+        graphics.Clear(light ? Color.FromArgb(247, 247, 247) : Color.FromArgb(31, 31, 31));
         graphics.CompositingMode = CompositingMode.SourceCopy;
-        graphics.InterpolationMode = dpi == 192 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic;
+        graphics.InterpolationMode = scale == 1 ? InterpolationMode.NearestNeighbor : InterpolationMode.HighQualityBicubic;
         graphics.PixelOffsetMode = PixelOffsetMode.Half;
         void Place(string name, int x, int y)
         {
-            using var stream = typeof(WechatTemplateLocator).Assembly.GetManifestResourceStream("WechatDraft.Windows.Templates." + name)
+            var suffix = light ? "_light" : "";
+            using var stream = typeof(WechatTemplateLocator).Assembly.GetManifestResourceStream($"WechatDraft.Windows.Templates.{name}{suffix}.png")
                 ?? throw new Exception("Missing toolbar test resource.");
             using var image = new Bitmap(stream);
-            var width = (int)Math.Round(image.Width * dpi / 192d); var height = (int)Math.Round(image.Height * dpi / 192d);
+            var width = (int)Math.Round(image.Width * scale); var height = (int)Math.Round(image.Height * scale);
             graphics.DrawImage(image, new Rectangle(x, y, width, height),
                 new Rectangle(0, 0, image.Width, image.Height), GraphicsUnit.Pixel);
         }
-        Place("wechat_top_template.png", 700, 40);
-        Place("wechat_bottom_template.png", 350, 610);
-        if (duplicate) Place("wechat_top_template.png", 700, 150);
+        Place("wechat_top_template", topX, 40);
+        Place("wechat_bottom_template", bottomX, 610);
+        if (duplicate) Place("wechat_top_template", topX, 150);
         return result;
     }
 

@@ -11,7 +11,7 @@ using WechatDraft.Core;
 namespace WechatDraft.Windows;
 
 public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progress = null, bool enableAppend = false,
-    nint clipboardOwner = 0, nint companion = 0, IChatTitleOcr? titleOcr = null) : IConversationAdapter, IDisposable
+    nint clipboardOwner = 0, nint companion = 0, IChatTitleOcr? titleOcr = null, bool forceGeneration = false) : IConversationAdapter, IDisposable
 {
     private readonly IChatTitleOcr _ocr = new ExactTitleOcrCache(titleOcr ?? WechatLocalTitleReader.Default);
     private Native.Rect _bounds;
@@ -20,26 +20,28 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     private uint _pid;
     private VisionLayout? _layout;
     private VisionContextSnapshot? _frozenContext;
+    private Capture? _scrolledContext;
+    private bool _contextScrollHalted;
     private VisionAnchorHints? _anchors;
     private OcrPrefillGuard? _guard;
-    private VisionInputRecheck? _inputCheck;
+    private VisionInputChangeLog? _inputChanges;
     private DebugSession? _debug;
     private Rectangle? _knownEmptyHint;
     private VisionInputMonitor? _monitor;
     private VisionClipboard? _clipboard;
     private System.Windows.Forms.Timer? _watch;
-    private bool _watchBusy, _disposed, _originalRead;
-    private int _ioDepth, _lastReadActivityVersion;
+    private bool _watchBusy, _disposed;
+    private int _ioDepth;
     private nint _companion;
     private string _prefillReason = "";
     private readonly SemaphoreSlim _appendGate = new(1, 1);
     private DebugSession? Debug => _debug ?? DebugSession.Current;
-    public bool CanAutoAppend => enableAppend && _originalRead && _guard is { Valid: true, PasteIssued: false };
+    public bool CanAutoAppend => enableAppend && _guard is { Valid: true, WriteIssued: false };
     public string AutoAppendUnavailableReason => _prefillReason.Length > 0 ? _prefillReason : enableAppend
         ? "本地 OCR 或完整草稿未通过核对，请检查后复制正文。" : "预填已关闭。请检查后复制正文。";
     public string StateChangeReason => _guard?.Reason is { Length: > 0 } reason ? reason : _prefillReason;
     public string CleanupWarning { get; private set; } = "";
-    public bool CanCollectMoreContext => false;
+    public bool CanCollectMoreContext => !_disposed && !_contextScrollHalted && _monitor is not null;
     public string AutomationMethod => "vision";
     public int LayoutApiCallCount => 0;
     public byte[]? PreviewPng { get; private set; }
@@ -83,7 +85,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     {
         PreviewPng = null; _layout = null; _anchors = null;
         (VisionLayout Layout, VisionAnchorHints Anchors) located;
-        try { located = await Task.Run(() => WechatLocalLayout.Locate(bitmap, dpi, ct), ct); }
+        try { located = await Task.Run(() => WechatLocalLayout.Locate(bitmap, dpi, ct, _identity), ct); }
         catch (Exception e) { DebugSession.Current?.Event("local_layout_failed", new { type = e.GetType().Name, e.Message }); throw; }
         _layout = located.Layout; _anchors = located.Anchors;
         _frame ??= new(new Rectangle(0, 0, bitmap.Width, bitmap.Height), dpi);
@@ -104,27 +106,31 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
     public async Task<ConversationSnapshot> BeginAsync(CancellationToken ct)
     {
         _debug = DebugSession.Current;
-        await CheckLayoutAsync(ct); await ReadLocalTitleAsync(ct);
-        if (!enableAppend) return CreateReadonlySnapshot(ct);
+        await CheckLayoutAsync(ct);
+        if (!forceGeneration) await ReadLocalTitleAsync(ct);
         Native.GetWindowThreadProcessId(companion, out var ownerPid);
         _companion = companion != 0 && ownerPid == Environment.ProcessId ? companion : 0;
         try
         {
-            _monitor = new VisionInputMonitor(target, stopOnWheel: false, stopOnClick: false, stopOnKeyboard: false, companion: _companion);
-            Report("读取草稿", "本地 OCR 标题已读取，正在核对输入区并保存原文", 18);
-            var original = (await ReadDraftAsync(ct)).Text;
-            _guard = new(_layout!.Title, original); _originalRead = true;
-            var baseline = await WaitForInputSettledAsync(_lastReadActivityVersion, ct);
-            _inputCheck = new(_guard, baseline, _frame!.Dpi, Debug);
+            _monitor = new VisionInputMonitor(target, stopOnWheel: false, stopOnClick: false, stopOnKeyboard: false,
+                companion: _companion, trackWheelActivity: false);
+            if (!enableAppend) return CreateReadonlySnapshot(ct);
+            if (!forceGeneration && Debug is { Enabled: true } debug)
+            {
+                using var image = _frozenContext!.CopyImage();
+                _inputChanges = new(CaptureInput(image, true), _frame!.Dpi, debug);
+            }
+            _guard = forceGeneration ? OcrPrefillGuard.WithoutTitleCheck() : new(_layout!.Title);
+            if (forceGeneration) return CreateReadonlySnapshot(ct) with { DirectAppend = true };
             _watch = new System.Windows.Forms.Timer { Interval = 400 };
             _watch.Tick += async (_, _) => await ObserveAsync(ct);
             _watch.Start();
-            return new(Guid.NewGuid().ToString("N"), _layout.Title, original, _identity, false, this, TitleSource: "ocr");
+            return CreateReadonlySnapshot(ct) with { DirectAppend = true };
         }
         catch (Exception e) when (e is InvalidOperationException or InvalidDataException)
         {
             _prefillReason = "本次仅生成，未预填：" + e.Message;
-            _monitor?.Dispose(); _monitor = null; _originalRead = false;
+            _monitor?.Dispose(); _monitor = null; _guard = null;
             DebugSession.Current?.Event("visual_prefill_unavailable", new { e.Message });
             Report("仅生成祝福", _prefillReason, 20);
             return CreateReadonlySnapshot(ct);
@@ -135,8 +141,9 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         ct.ThrowIfCancellationRequested();
         if (_frame is null || _layout is null || _frozenContext is null) throw new InvalidOperationException("本地视觉区域尚未准备。");
         var titleRead = !string.IsNullOrWhiteSpace(_layout.Title);
-        return new(Guid.NewGuid().ToString("N"), _layout.Title, "", _identity, false, this,
-            OriginalTextRead: false, DisplayNameRead: titleRead, TitleSource: titleRead ? "ocr" : "model");
+        return new(Guid.NewGuid().ToString("N"), _layout.Title, "", _identity, this,
+            OriginalTextRead: false, DisplayNameRead: titleRead, TitleSource: titleRead ? "ocr" : forceGeneration ? "none" : "model")
+            { ForceGeneration = forceGeneration };
     }
 
     private string Identity()
@@ -168,70 +175,109 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         if (!desktop.Contains(_frame!.Bounds)) throw new InvalidOperationException("微信窗口部分位于屏幕之外，请完整显示后重试。");
         for (var row = 0; row < 5; row++)
             for (var col = 0; col < 7; col++)
-                CheckPoint(_bounds.Left + 16 + (_bounds.Width - 32) * col / 6, _bounds.Top + 16 + (_bounds.Height - 32) * row / 4);
-        var image = new Bitmap(_bounds.Width, _bounds.Height, PixelFormat.Format32bppArgb);
+                CheckPoint(_bounds.Left + 16 + (_bounds.Width - 32) * col / 6,
+                    _bounds.Top + 16 + (_bounds.Height - 32) * row / 4, debugStage ?? "window-capture");
+        var image = CaptureWindowPixels();
         try
         {
-            using (var graphics = Graphics.FromImage(image)) graphics.CopyFromScreen(_bounds.Left, _bounds.Top, 0, 0, image.Size);
             EnsureWindow(ct); _frame.ValidateImageSize(image.Size);
             if (debugStage is not null) DebugImage(debugStage, image);
             return image;
         }
         catch { image.Dispose(); throw; }
     }
-    private void CheckPoint(int x, int y)
+    private Bitmap CaptureWindowPixels()
     {
-        if (Native.GetAncestor(Native.WindowFromPoint(new Native.Point { X = x, Y = y }), 2) != target)
-            throw new InvalidOperationException("微信关键区域被遮挡，未继续预填。");
+        var image = new Bitmap(_bounds.Width, _bounds.Height, PixelFormat.Format32bppArgb);
+        try
+        {
+            using var graphics = Graphics.FromImage(image);
+            graphics.CopyFromScreen(_bounds.Left, _bounds.Top, 0, 0, image.Size);
+            return image;
+        }
+        catch { image.Dispose(); throw; }
+    }
+    private void CheckPoint(int x, int y, string stage)
+    {
+        var hit = Native.WindowFromPoint(new Native.Point { X = x, Y = y });
+        var root = Native.GetAncestor(hit, 2);
+        if (root == target) return;
+        if (Debug is { Enabled: true } debug)
+            RecordPointFailure(debug, x, y, stage, hit, root);
+        throw new InvalidOperationException("无法确认微信窗口在检查点可见，已停止本次视觉操作。");
+    }
+    private void RecordPointFailure(DebugSession debug, int x, int y, string stage, nint hit, nint root)
+    {
+        var checkedUtc = DateTimeOffset.UtcNow;
+        var localX = x - _bounds.Left;
+        var localY = y - _bounds.Top;
+        var foreground = Native.GetForegroundWindow();
+        try
+        {
+            using var image = CaptureWindowPixels();
+            using (var graphics = Graphics.FromImage(image))
+            using (var outline = new Pen(Color.White, 6))
+            using (var marker = new Pen(Color.Red, 3))
+            {
+                var circle = new Rectangle(localX - 12, localY - 12, 24, 24);
+                graphics.DrawEllipse(outline, circle);
+                graphics.DrawEllipse(marker, circle);
+            }
+            debug.WriteBytes("window-point-failed", Png(image), ".png");
+        }
+        catch (Exception e)
+        {
+            debug.Event("visual-window-point-image-failed", new { stage, type = e.GetType().Name });
+        }
+        debug.WriteJson("window-point-failed", new
+        {
+            stage, checkedUtc, screenPoint = new { x, y }, imagePoint = new { x = localX, y = localY },
+            target = target.ToInt64(), foreground = foreground.ToInt64(), window = _frame!.Bounds,
+            hit = hit.ToInt64(), root = root == 0 ? null : Native.DescribeWindow(root)
+        });
     }
     private bool Reject(string reason)
     {
         if (_prefillReason.Length == 0) Debug?.Event("visual-prefill-rejected", new { reason });
         _prefillReason = reason; _guard?.Reject(reason); return false;
     }
-    private async Task<bool> CheckLiveAsync(CancellationToken ct, bool checkInput, bool recheckDraft = true)
+    private async Task<bool> CheckLiveAsync(CancellationToken ct, bool observeInput = false)
     {
         EnsureWindow(ct);
         if (_guard is { Valid: false }) return false;
+        if (forceGeneration) return true;
         using var current = Screenshot(ct);
-        var title = await ReadTitleAsync(current, ct);
-        EnsureWindow(ct);
-        if (_guard is not null ? !_guard.CheckTitle(title) : title != _layout!.Title) return Reject("OCR 聊天标题已变化，未继续预填。");
+        if (!await CheckTitleAsync(current, ct)) return false;
         // A timer that was awaiting OCR must not observe our own copy/paste in progress.
-        if (!recheckDraft && (_ioDepth > 0 || _guard?.PasteIssued == true)) return _guard?.Valid != false;
-        if (checkInput && _inputCheck is not null)
-        {
-            _inputCheck.Observe(CaptureInput(current));
-            if (recheckDraft && _inputCheck.Pending)
-            {
-                _ioDepth++;
-                try
-                {
-                    return await _inputCheck.ConfirmAsync(ReadDraftAsync,
-                        token => WaitForInputSettledAsync(_lastReadActivityVersion, token), ct);
-                }
-                finally { _ioDepth--; }
-            }
-        }
+        if (observeInput && _ioDepth == 0 && _guard?.WriteIssued != true && _inputChanges is not null)
+            _inputChanges.Observe(CaptureInput(current, true));
         return true;
     }
-    private VisionRegionSnapshot CaptureInput(Bitmap image) => VisionRegionSnapshot.CaptureInput(image, _layout!, _frame!.Dpi,
-        normalizeEmptyHint: _guard is { OriginalText: "" }, knownEmptyHint: _knownEmptyHint,
+    private async Task<bool> CheckTitleAsync(Bitmap image, CancellationToken ct)
+    {
+        if (forceGeneration) return _guard?.Valid != false;
+        var title = await ReadTitleAsync(image, ct);
+        EnsureWindow(ct);
+        if (_guard is not null ? !_guard.CheckTitle(title) : title != _layout!.Title)
+            return Reject("OCR 聊天标题已变化，未继续预填。");
+        return true;
+    }
+    private VisionRegionSnapshot CaptureInput(Bitmap image, bool emptyDraft) => VisionRegionSnapshot.CaptureInput(image, _layout!, _frame!.Dpi,
+        normalizeEmptyHint: emptyDraft, knownEmptyHint: _knownEmptyHint,
         hintObserved: hint => _knownEmptyHint = hint);
-    private Task<VisionRegionSnapshot> WaitForInputSettledAsync(int version, CancellationToken ct, VisionRegionSnapshot? changedFrom = null) =>
+    private Task<VisionRegionSnapshot> WaitForInputSettledAsync(int version, CancellationToken ct, VisionRegionSnapshot changedFrom) =>
         VisionInputSettler.WaitAsync(async token =>
         {
             using var image = Screenshot(token);
-            var title = await ReadTitleAsync(image, token);
+            if (!await CheckTitleAsync(image, token)) throw new InvalidOperationException(StateChangeReason);
             CheckActivity(version, token);
-            if (_guard is null || !_guard.CheckTitle(title)) throw new InvalidOperationException(StateChangeReason);
-            return CaptureInput(image);
+            return CaptureInput(image, true);
         }, () => CheckActivity(version, ct), _frame!.Dpi, ct, changedFrom);
     private async Task ObserveAsync(CancellationToken ct)
     {
-        if (_disposed || _watchBusy || _ioDepth > 0 || _guard is not { Valid: true, PasteIssued: false } || Native.GetForegroundWindow() != target) return;
+        if (_disposed || _watchBusy || _ioDepth > 0 || _guard is not { Valid: true, WriteIssued: false } || Native.GetForegroundWindow() != target) return;
         _watchBusy = true;
-        try { await CheckLiveAsync(ct, true, recheckDraft: false); }
+        try { await CheckLiveAsync(ct, observeInput: true); }
         catch (Exception e) when (e is not OperationCanceledException)
         {
             if (!_disposed)
@@ -255,7 +301,7 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         if ((_monitor?.ActivityVersion ?? 0) != version)
         {
             DebugSession.Current?.Event("visual-input-interrupted", new { expectedVersion = version, currentVersion = _monitor?.ActivityVersion,
-                activity = _monitor?.LastActivity, pasteIssued = _guard?.PasteIssued == true });
+                activity = _monitor?.LastActivity, writeIssued = _guard?.WriteIssued == true });
             throw new InvalidOperationException("复制或填写期间检测到" + (_monitor?.LastActivityDescription ?? "用户操作") + "，已停止本次预填。");
         }
     }
@@ -272,59 +318,55 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
             }
         return new(local.X + _frame.Bounds.X, local.Y + _frame.Bounds.Y);
     }
-    private async Task<ClipboardDraftRead> ReadDraftAsync(CancellationToken ct)
+    private async Task<ClipboardDraftRead> ReadDraftAsync(VisionClipboard clipboard, int version, CancellationToken ct)
     {
-        _ioDepth++;
-        var owned = _clipboard is null;
+        if (!_guard!.Valid) throw new InvalidOperationException(StateChangeReason);
+        EnsureModifiersReleased();
+        var point = InputPoint(); CheckPoint(point.X, point.Y, "draft-read-click"); CheckActivity(version, ct);
+        var clickStarted = Stopwatch.GetTimestamp();
+        Native.VisionClick(point.X, point.Y); CheckActivity(version, ct);
+        var shortcutsStarted = Stopwatch.GetTimestamp();
         try
         {
-            if (!await CheckLiveAsync(ct, false)) throw new InvalidOperationException(StateChangeReason);
-            var version = CheckInputReady(ct);
-            _clipboard ??= new VisionClipboard(clipboardOwner);
-            var point = InputPoint(); CheckPoint(point.X, point.Y); CheckActivity(version, ct);
-            Native.VisionClick(point.X, point.Y); CheckActivity(version, ct);
-            _clipboard.PutText("WechatDraft-visual-read-" + Guid.NewGuid().ToString("N"));
-            try
-            {
-                Native.VisionChord(0x41);
-            }
-            finally
-            {
-                // Copy and collapse immediately; no selection screenshot or caret check.
-                if (Native.GetForegroundWindow() == target && Native.IsWindow(target)) Native.VisionCopyAndCollapse();
-            }
-            var read = await VisionClipboardPoller.ReadAsync(() =>
-            {
-                var available = _clipboard.TryReadCopied(_pid, out var text);
-                return (available, text);
-            }, () => CheckActivity(version, ct), ct);
-            DebugSession.Current?.Event("visual_draft_copy", new { read.ClipboardUpdated, assumedEmpty = !read.ClipboardUpdated,
-                copiedCharacters = read.ClipboardUpdated ? (int?)read.Text.Length : null,
-                rule = "unchanged-clipboard-assumed-empty-after-response-window", read.Attempts, read.ElapsedMs, maxCopyWaitMs = 150 });
-            if (!await CheckLiveAsync(ct, false)) throw new InvalidOperationException(StateChangeReason);
-            CheckActivity(version, ct);
-            _lastReadActivityVersion = version;
-            return read;
+            Native.VisionChord(0x41);
         }
         finally
         {
-            if (owned && _clipboard is not null)
-            {
-                try { _clipboard.Dispose(); }
-                finally { _clipboard = null; _ioDepth--; }
-            }
-            else _ioDepth--;
+            // Copy and collapse immediately; no selection screenshot or caret check.
+            if (Native.GetForegroundWindow() == target && Native.IsWindow(target)) Native.VisionCopyAndCollapse();
         }
+        var pollStarted = Stopwatch.GetTimestamp();
+        var read = await VisionClipboardPoller.ReadAsync(() =>
+        {
+            var available = clipboard.TryReadCopied(_pid, out var text);
+            return (available, text);
+        }, () => CheckActivity(version, ct), ct);
+        DebugSession.Current?.Event("visual_draft_copy", new { read.ClipboardUpdated,
+            copiedCharacters = read.ClipboardUpdated ? (int?)read.Text.Length : null,
+            phase = "readback",
+            clickMs = Stopwatch.GetElapsedTime(clickStarted, shortcutsStarted).TotalMilliseconds,
+            shortcutsMs = Stopwatch.GetElapsedTime(shortcutsStarted, pollStarted).TotalMilliseconds,
+            read.Attempts, read.ElapsedMs, maxCopyWaitMs = 150 });
+        if (!forceGeneration)
+        {
+            using var image = Screenshot(ct);
+            if (!await CheckTitleAsync(image, ct)) throw new InvalidOperationException(StateChangeReason);
+        }
+        CheckActivity(version, ct);
+        return read;
     }
 
-    public Task<Capture> CaptureAsync(ConversationSnapshot snapshot, int index, CancellationToken ct)
+    public async Task<Capture> CaptureAsync(ConversationSnapshot snapshot, int index, CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         if (snapshot.NativeState != this || _frozenContext is null) throw new InvalidOperationException("聊天快照不属于本次任务。");
-        var capture = _frozenContext.Capture(_frame!, _layout!, index) with { RequiresConversationCheck = true,
+        var context = index == 0 ? await CaptureMessagePageAsync(snapshot, firstPage: true, ct) ??
+            _frozenContext.Capture(_frame!, _layout!, index)
+            : _scrolledContext ?? throw new InvalidOperationException("未取得上滚后的消息区。");
+        var capture = context with { Id = $"vision_context_{index}", RequiresConversationCheck = !forceGeneration,
             LocalTitle = string.IsNullOrWhiteSpace(_layout!.Title) ? null : _layout.Title };
         if (DebugSession.Current is { Enabled: true } debug) debug.WriteBytes("greeting_context_" + index, capture.PngBytes, ".png");
-        return Task.FromResult(capture);
+        return capture;
     }
     public async Task<bool> IsUnchangedAsync(ConversationSnapshot snapshot, CancellationToken ct)
     {
@@ -335,18 +377,133 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         if (_monitor?.Changed == true) return Reject("切换到了其他程序，未继续预填。");
         if (Native.GetForegroundWindow() == _companion && _companion != 0) return true;
         _ioDepth++;
-        try { return await CheckLiveAsync(ct, true); }
+        try { return await CheckLiveAsync(ct); }
         catch (Exception e) when (e is not OperationCanceledException) { return Reject(e.Message); }
         finally { _ioDepth--; }
     }
     public async Task<bool> WaitForAppendReadyAsync(ConversationSnapshot snapshot, CancellationToken ct)
     {
-        if (_guard is null) return false;
+        if (snapshot.NativeState != this || _guard is null) return false;
         var result = await UiaForegroundWaiter.WaitAsync(() => Native.GetForegroundWindow() == target,
-            token => IsUnchangedAsync(snapshot, token), () => Report("等待返回微信", "请回到原微信聊天，OCR 标题和原文核对后预填", 87), ct);
+            _ =>
+            {
+                if (_monitor?.Changed == true) return Task.FromResult(Reject("切换到了其他程序，未继续预填。"));
+                var foreground = Native.GetForegroundWindow();
+                return Task.FromResult(!_disposed && _guard.Valid &&
+                    (foreground == target || foreground == _companion && _companion != 0));
+            }, () => Report("等待返回微信", forceGeneration ? "请回到所选微信窗口，祝福会追加到当前草稿"
+                : "请回到原微信聊天，核对标题后追加到当前草稿", 87), ct);
         return result == ForegroundWaitResult.Ready || Reject(result == ForegroundWaitResult.TimedOut ? "等待返回微信超时，请复制正文。" : StateChangeReason);
     }
-    public Task<bool> ScrollUpAsync(ConversationSnapshot snapshot, CancellationToken ct) { ct.ThrowIfCancellationRequested(); return Task.FromResult(false); }
+    public async Task<bool> ScrollUpAsync(ConversationSnapshot snapshot, CancellationToken ct)
+    {
+        _scrolledContext = await CaptureMessagePageAsync(snapshot, firstPage: false, ct);
+        return _scrolledContext is not null;
+    }
+    private async Task<Capture?> CaptureMessagePageAsync(ConversationSnapshot snapshot, bool firstPage, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (snapshot.NativeState != this || _frozenContext is null || !CanCollectMoreContext) return null;
+        var monitor = _monitor!;
+        Capture? Stop(string reason)
+        {
+            _contextScrollHalted = true;
+            Debug?.Event("visual-context-scroll-stopped", new { reason });
+            return null;
+        }
+        bool CanContinue() => !_disposed && !monitor.Changed && !monitor.WheelObserved && _guard is not { Valid: false };
+        var ready = await UiaForegroundWaiter.WaitAsync(() => Native.GetForegroundWindow() == target,
+            _ => Task.FromResult(CanContinue() &&
+                VisionInteractionState.IsAllowedForeground(Native.GetForegroundWindow(), target, _companion)),
+            () => Report("等待返回微信", forceGeneration ? "请在 10 秒内回到所选微信窗口，继续采集消息"
+                : "请在 10 秒内回到原聊天，继续采集消息", 25), ct,
+            timeout: TimeSpan.FromSeconds(10));
+        if (ready != ForegroundWaitResult.Ready)
+            return Stop(ready == ForegroundWaitResult.TimedOut ? "wechat-foreground-timeout" :
+                monitor.WheelObserved ? "user-scrolled" : "foreground-or-conversation-changed");
+
+        var version = monitor.ActivityVersion;
+        bool SameActivity() => CanContinue() && Native.GetForegroundWindow() == target && monitor.ActivityVersion == version;
+        _ioDepth++;
+        try
+        {
+            using var initial = _frozenContext.CopyImage();
+            using var before = Screenshot(ct);
+            if (!await CheckTitleAsync(before, ct)) return Stop("title-changed-before-scroll");
+            var frame = _frame!;
+            var layout = _layout!;
+            Task<bool> CheckGeometryAsync(Bitmap image) => Task.Run(() =>
+                WechatLocalLayout.ConfirmMessageGeometry(initial, image, frame, layout, _anchors!, ct), ct);
+            if (!await CheckGeometryAsync(before)) return Stop("layout-changed-before-scroll");
+            if (!SameActivity()) return Stop("activity-before-scroll");
+
+            var messages = frame.ToClientRectangle(layout.Messages!);
+            var gutter = (int)Math.Ceiling(23d * frame.Dpi / 96);
+            if (messages.Width <= gutter * 2) return Stop("message-pane-too-narrow");
+            var content = Rectangle.FromLTRB(messages.Left, messages.Top, messages.Right - gutter, messages.Bottom);
+            var previous = firstPage ? null : VisionRegionSnapshot.Capture(before, content);
+
+            if (firstPage)
+            {
+                var point = VisionMessageScroll.BottomThumbPoint(frame.ToClientRectangle(layout.Input!), frame.Dpi);
+                if (!messages.Contains(point) || content.Contains(point)) return Stop("page-up-thumb-outside-scrollbar-gutter");
+                var x = frame.Bounds.Left + point.X;
+                var y = frame.Bounds.Top + point.Y;
+                if (!SameActivity() || !Native.GetCursorPos(out var cursor)) return Stop("activity-before-thumb-click");
+                EnsureModifiersReleased();
+                if ((Native.GetAsyncKeyState(0x01) & 0x8000) != 0 || (Native.GetAsyncKeyState(0x02) & 0x8000) != 0 ||
+                    (Native.GetAsyncKeyState(0x04) & 0x8000) != 0) return Stop("mouse-button-held");
+                CheckPoint(x, y, "context-scroll-click");
+                try { Native.VisionClick(x, y); }
+                finally
+                {
+                    if (Native.GetCursorPos(out var current) && current.X == x && current.Y == y)
+                        Native.SetCursorPos(cursor.X, cursor.Y);
+                }
+            }
+            var key = (ushort)(firstPage ? 0x22 : 0x21);
+            var presses = firstPage ? 3 : 1;
+            ct.ThrowIfCancellationRequested();
+            if (!SameActivity()) return Stop("activity-before-page-key");
+            EnsureModifiersReleased();
+            if ((Native.GetAsyncKeyState(key) & 0x8000) != 0) return Stop("page-key-already-held");
+            Native.VisionPage(key, presses);
+            var started = Stopwatch.GetTimestamp();
+            var observations = 0;
+            while (true)
+            {
+                if (!SameActivity()) return Stop("activity-after-page-key");
+                using var after = Screenshot(ct);
+                observations++;
+                var next = VisionRegionSnapshot.Capture(after, content);
+                var same = previous?.Matches(next, allowCaret: false);
+                var elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+                if (firstPage ? same == true && elapsed >= 60 : same == false)
+                {
+                    if (!await CheckTitleAsync(after, ct)) return Stop("title-changed-after-page-key");
+                    if (!await CheckGeometryAsync(after)) return Stop("layout-changed-after-page-key");
+                    if (!SameActivity()) return Stop("activity-after-page-key");
+                    var capture = VisionContextSnapshot.CreateCapture(after, frame, layout, 0);
+                    var shift = firstPage ? 0 : VisionMessageScroll.EstimateDownwardShift(previous!, next);
+                    Debug?.Event("visual-context-scroll-page", new { key = firstPage ? "PageDown" : "PageUp", presses,
+                        measuredPixels = shift > 0 ? (int?)shift : null, observations,
+                        elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds });
+                    return capture;
+                }
+                if (firstPage) previous = next;
+                var remaining = 220 - elapsed;
+                if (remaining <= 0) return Stop(firstPage ? "page-down-messages-not-settled" : "page-up-did-not-change-messages");
+                await Task.Delay(TimeSpan.FromMilliseconds(Math.Min(15, remaining)), ct);
+            }
+        }
+        catch (Exception e) when (e is InvalidOperationException or InvalidDataException)
+        {
+            Debug?.Event("visual-context-scroll-stopped", new { e.Message });
+            _contextScrollHalted = true;
+            return null;
+        }
+        finally { _ioDepth--; }
+    }
 
     public async Task<FillResult> AppendAsync(ConversationSnapshot snapshot, string greeting, CancellationToken ct)
     {
@@ -354,45 +511,77 @@ public sealed class WechatVisionAdapter(nint target, Action<TaskProgress>? progr
         _ioDepth++;
         try
         {
-            if (snapshot.NativeState != this || !_originalRead || _guard is null || !snapshot.OriginalTextRead || snapshot.TitleSource != "ocr")
+            if (snapshot.NativeState != this || !enableAppend || _guard is null || !snapshot.DirectAppend ||
+                snapshot.ForceGeneration != forceGeneration || (!forceGeneration && snapshot.TitleSource != "ocr"))
                 return new("待手动处理", AutoAppendUnavailableReason);
-            if (_guard.PasteIssued) return new("预填结果待确认", "本次已尝试填写，未重复粘贴。");
-            if (!_guard.Valid || !await CheckLiveAsync(ct, true)) return new("待手动处理", StateChangeReason);
+            if (_guard.WriteIssued) return new("预填结果待确认", "本次已尝试填写，未重复写入。");
+            if (!_guard.Valid) return new("待手动处理", StateChangeReason);
+            var version = CheckInputReady(ct);
             using (var currentFrame = Screenshot(ct, "before_visual_prefill"))
+            using (var initial = _frozenContext!.CopyImage())
             {
-                var located = await Task.Run(() => WechatLocalLayout.Locate(currentFrame, _frame!.Dpi, ct), ct);
-                if (!WechatLocalLayout.SameGeometry(_layout!, located.Layout, currentFrame.Width, currentFrame.Height))
-                    return new("待手动处理", "本地复查发现输入区布局已变化，未填写。");
+                var started = Stopwatch.GetTimestamp();
+                var (sameGeometry, reused) = await Task.Run(() =>
+                {
+                    if (WechatLocalLayout.CanReuseGeometry(initial, currentFrame, _frame!.Dpi, _layout!, _anchors!, ct))
+                        return (true, true);
+                    var located = WechatLocalLayout.Locate(currentFrame, _frame!.Dpi, ct, _identity);
+                    return (WechatLocalLayout.SameGeometry(_layout!, located.Layout, currentFrame.Width, currentFrame.Height), false);
+                }, ct);
+                Debug?.Event("visual-prefill-layout-checked", new { reused, sameGeometry, elapsedMs = Stopwatch.GetElapsedTime(started).TotalMilliseconds });
+                if (!sameGeometry) return new("待手动处理", "本地复查发现输入区布局已变化，未填写。");
             }
-            _clipboard = new VisionClipboard(clipboardOwner);
-            var current = (await ReadDraftAsync(ct)).Text;
-            if (!_guard.CheckDraft(current)) return new("待手动处理", _guard.Reason);
-            var version = _lastReadActivityVersion;
+            if (!await CheckLiveAsync(ct)) return new("待手动处理", StateChangeReason);
             CheckActivity(version, ct);
-            var beforePaste = await WaitForInputSettledAsync(version, ct);
+            var backupStarted = Stopwatch.GetTimestamp();
+            VisionClipboard? clipboard = null;
+            Native.INPUT[]? directInput = null;
+            try
+            {
+                clipboard = _clipboard = new VisionClipboard(clipboardOwner);
+                Debug?.Event("visual-clipboard-backup", new { elapsedMs = Stopwatch.GetElapsedTime(backupStarted).TotalMilliseconds });
+            }
+            catch (ClipboardBackupUnavailableException)
+            {
+                directInput = Native.PrepareUnicodeInput(greeting);
+            }
+            var point = InputPoint(); CheckPoint(point.X, point.Y, "prefill-click"); CheckActivity(version, ct);
+            Native.VisionClick(point.X, point.Y);
             EnsureModifiersReleased();
-            if (!await CheckLiveAsync(ct, false)) return new("待手动处理", StateChangeReason);
             CheckActivity(version, ct);
-            _clipboard.PutText(DraftRules.AppendSuffix(snapshot.OriginalText, greeting));
             Native.VisionChord(0x23);
+            VisionRegionSnapshot beforePaste;
+            using (var image = Screenshot(ct))
+            {
+                if (!await CheckTitleAsync(image, ct)) return new("待手动处理", StateChangeReason);
+                beforePaste = CaptureInput(image, true);
+            }
+            EnsureModifiersReleased();
             CheckActivity(version, ct);
-            if (!_guard.TryIssuePaste()) return new("预填结果待确认", "本次写入状态已变化，未重复粘贴。");
+            clipboard?.PutText(greeting);
+            CheckActivity(version, ct);
+            if (!_guard.TryIssueWrite()) return new("预填结果待确认", "本次写入状态已变化，未重复填写。");
+            if (directInput is not null)
+            {
+                Native.Keys(directInput);
+                await WaitForInputSettledAsync(version, ct, beforePaste);
+                return new("预填结果待确认", "已通过键盘尝试追加祝福，原剪贴板已保留。请检查微信草稿。");
+            }
             Native.VisionChord(0x56);
-            DebugSession.Current?.Event("visual_paste_issued", new { characters = greeting.Length, ocrEngine = _ocr.Name,
+            DebugSession.Current?.Event("visual_paste_issued", new { characters = greeting.Length, ocrEngine = forceGeneration ? null : _ocr.Name,
                 readbackWait = "input-changed-and-stable" });
             CheckActivity(version, ct);
-            // Keep the suffix on the clipboard until WeChat has visibly consumed it.
-            // A read probe issued earlier could otherwise replace the pending paste.
+            // Keep the paste payload on the clipboard until WeChat replaces it with a fresh copy.
             await WaitForInputSettledAsync(version, ct, beforePaste);
-            var actual = (await ReadDraftAsync(ct)).Text;
-            var preserved = DraftRules.NormalizeNewlines(actual) == DraftRules.NormalizeNewlines(DraftRules.Append(snapshot.OriginalText, greeting));
-            return preserved ? new("已预填", "OCR 标题一致，原文与新增祝福已读回核对。请检查后手动发送。", true)
-                : new("预填结果待确认", "未读回完整预期草稿，请检查微信；未重复写入。");
+            var actual = await ReadDraftAsync(clipboard!, version, ct);
+            return actual.ConfirmsSuffix(greeting)
+                ? new("已预填", forceGeneration ? "已读回文末祝福。请检查后手动发送。" : "OCR 标题一致，已读回文末祝福。请检查后手动发送。")
+                : new("预填结果待确认", "未能确认文末祝福，请检查微信；未重复写入。");
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
             Reject(e.Message);
-            return new(_guard?.PasteIssued == true ? "预填结果待确认" : "待手动处理", e.Message);
+            return new(_guard?.WriteIssued == true ? "预填结果待确认" : "待手动处理", e.Message);
         }
         finally
         {

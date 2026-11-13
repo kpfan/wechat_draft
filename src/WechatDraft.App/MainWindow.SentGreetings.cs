@@ -43,8 +43,9 @@ public sealed partial class MainWindow
     {
         if (_runCancellation is not null || _coordinator.IsRunning) return;
         RefreshWindows();
-        if (_settings.DemoMode || _windows?.SelectedItem is not WechatWindow window)
-        { Notify("请关闭演示模式并选择目标微信窗口。", InfoBarSeverity.Warning); return; }
+        if (_windows?.SelectedItem is not WechatWindow window)
+        { Notify("请选择目标微信窗口。", InfoBarSeverity.Warning); return; }
+        if (!await ConfirmScreenshotUploadAsync() || IsTaskBusy) return;
         StopSentRecording();
         _sentStarting = true;
         _runCancellation = new CancellationTokenSource(TimeSpan.FromSeconds(Math.Clamp(_settings.TaskTimeoutSeconds, 10, 180)));
@@ -53,9 +54,6 @@ public sealed partial class MainWindow
         var configuration = _settings with { };
         try
         {
-            var origin = DraftRules.Origin(configuration);
-            if (configuration.AuthorizedOrigin != origin)
-                throw new InvalidDataException("请先在设置中授权必要聊天截图，再开启归档。");
             _sentMonitor = await WechatSentGreetingMonitor.StartAsync(window.Handle, _runCancellation.Token);
             _sentSession = CancellationTokenSource.CreateLinkedTokenSource(_sentShutdown.Token);
             var sessionToken = _sentSession.Token;
@@ -134,18 +132,6 @@ public sealed partial class MainWindow
         StopSentRecording(); _sentShutdown.Cancel(); _sentQueue.Writer.TryComplete();
     }
 
-    private void SimulateSentGreeting()
-    {
-        var text = _demoInput?.Text ?? "";
-        if (string.IsNullOrWhiteSpace(text)) { Notify("请先在演示输入框写一条祝福。", InfoBarSeverity.Warning); return; }
-        var contact = _demoContacts[Math.Clamp(_demoIndex, 0, _demoContacts.Count - 1)];
-        _repository.SaveSentGreeting(new SentGreetingRecord { AccountScope = _settings.AccountScope, ContactId = contact.Id,
-            DisplayName = contact.DisplayName, Text = text, Status = "已记录", VerifiedAt = DateTimeOffset.UtcNow,
-            IsDemo = true, Model = "本地演示 · 无 API 调用", Trigger = "演示发送", Detail = "虚构演示记录，未发送微信消息。" });
-        _demoInput!.Text = "";
-        Notify("演示祝福已按最终文字保存，可在“已发送祝福”查看。", InfoBarSeverity.Success);
-    }
-
     private void ShowSentGreetings()
     {
         SelectNavigation(nameof(ShowSentGreetings));
@@ -155,7 +141,7 @@ public sealed partial class MainWindow
         void Render()
         {
             list.Children.Clear(); status.Text = _sentMessage; var keyword = search.Text.Trim();
-            var records = _repository.SentGreetings(_settings.AccountScope, loaded)
+            var records = _repository.SentGreetings(_settings.AccountScope, loaded, includeDemo: false)
                 .Where(x => x.Status != "无需归档" && (keyword.Length == 0 ||
                     (x.DisplayName + x.Text + x.Status).Contains(keyword, StringComparison.OrdinalIgnoreCase))).ToList();
             if (records.Count == 0) list.Children.Add(Ui.Text("还没有已发送祝福。开启归档后，发送的祝福会自动出现在这里。", 14, "71817B"));
@@ -165,7 +151,6 @@ public sealed partial class MainWindow
                     Ui.Text(record.Text.Length > 0 ? record.Text : "尚未取得可确认的完整正文。", 15),
                     Ui.Text($"观察时间：{record.ObservedAt.ToLocalTime():yyyy-MM-dd HH:mm:ss} · {record.Model} · 核对请求 {record.ApiCallCount} 次", 12, "7C8B81"),
                     Ui.Text(record.Detail, 12, "7C8B81"));
-                if (record.IsDemo) body.Children.Add(Ui.Badge("演示记录 · 未发送微信消息"));
                 var delete = Ui.Button("删除", async () =>
                 {
                     if (await ConfirmAsync("删除这条发送记录？", "删除后无法在本应用中恢复。"))

@@ -59,7 +59,7 @@ public sealed class SentGreetingArchiver(LocalRepository repository, ISecretProt
                 if (existing.AccountScope != settings.AccountScope) throw new InvalidDataException("发送观察属于其他账号工作区。");
                 return existing; // Never replay an uncertain observation.
             }
-            if (settings.DemoMode || settings.AuthorizedOrigin != DraftRules.Origin(settings))
+            if (settings.AuthorizedOrigin != DraftRules.Origin(settings))
                 throw new InvalidDataException("请先授权当前服务读取聊天截图。");
             if (string.IsNullOrWhiteSpace(observation.DisplayName) || observation.Before.PngBytes.Length == 0 ||
                 observation.After.PngBytes.Length == 0 || (long)observation.Before.PngBytes.Length + observation.After.PngBytes.Length > 12 * 1024 * 1024)

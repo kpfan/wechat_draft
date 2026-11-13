@@ -25,7 +25,7 @@ public sealed class ThirdVersionRun
     public bool IsReleased => Released;
     public AppSettings Settings => ThirdVersionSession.Clone(InputSettings);
     public bool CanAppend => !Released && !Expired && !WriteAttempted && InputSettings.EnableLiveAppend &&
-        Snapshot is { DisplayNameRead: true, OriginalTextRead: true } && Adapter.CanAutoAppend &&
+        Snapshot is { ForceGeneration: false, DisplayNameRead: true } snapshot && (snapshot.OriginalTextRead || snapshot.DirectAppend) && Adapter.CanAutoAppend &&
         AppendBlockReason.Length == 0 && Session is not null && SelectedIndex >= 0 && SelectedIndex < Session.Revisions.Count;
     internal Guid Owner { get; }
     internal AppSettings InputSettings { get; }
@@ -67,7 +67,6 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
             await ExecuteAsync(run, async token =>
             {
                 var input = run.InputSettings;
-                if (input.DemoMode) throw new InvalidDataException("第三版真实流程不处理演示会话，请使用原演示流程。");
                 if (string.IsNullOrWhiteSpace(input.Scene) || input.Scene.Length > 100 || input.ExtraInstruction.Length > 4000)
                     throw new InvalidDataException("请选择祝福场景，并检查补充要求长度。");
                 run.Record.ProviderOrigin = DraftRules.Origin(input);
@@ -76,61 +75,74 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
                 Report("检查会话", "正在保留当前窗口、聊天标题及原始草稿基线", 8);
                 run.Snapshot = await adapter.BeginAsync(token);
                 var snapshot = run.Snapshot;
-                if (snapshot.IsDemo) throw new InvalidDataException("真实流程不能使用演示适配器。");
-                run.Record.DisplayName = snapshot.DisplayName;
+                var forceGeneration = snapshot.ForceGeneration;
+                run.Record.DisplayName = forceGeneration ? "强制生成" : snapshot.DisplayName;
                 run.Record.OriginalTextRead = snapshot.OriginalTextRead;
-                if (!adapter.CanAutoAppend)
+                if (forceGeneration)
+                    run.AppendBlockReason = "强制生成跳过身份核对，本次仅可复制；请重新触发普通模式后再预填。";
+                else if (!adapter.CanAutoAppend)
                     run.AppendBlockReason = adapter.AutoAppendUnavailableReason.Length > 0 ? adapter.AutoAppendUnavailableReason : "任务开始时没有自动追加能力，本次仅可复制。";
                 run.Record.OriginalCharacters = snapshot.OriginalTextRead ? DraftRules.VisibleLength(snapshot.OriginalText) : 0;
-                if (snapshot.DisplayNameRead && DraftRules.LooksLikeGroupTitle(snapshot.DisplayName)) throw new GroupChatDetectedException();
-                if (!snapshot.DisplayNameRead && (adapter.CanAutoAppend || snapshot.OriginalTextRead))
-                    throw new InvalidDataException("本次没有独立读取聊天标题，只能使用未读取草稿的只读快照。");
-                if (!snapshot.OriginalTextRead && adapter.CanAutoAppend)
+                if (!forceGeneration && snapshot.DisplayNameRead && DraftRules.LooksLikeGroupTitle(snapshot.DisplayName)) throw new GroupChatDetectedException();
+                if (!forceGeneration && !snapshot.DisplayNameRead)
+                    throw new InvalidDataException("本地未能读取有效聊天标题，普通模式已停止；可使用强制生成并人工核对后复制。");
+                if (!forceGeneration && !snapshot.OriginalTextRead && !snapshot.DirectAppend && adapter.CanAutoAppend)
                     throw new InvalidDataException("本次未读取完整草稿，不能自动追加。");
-                var contact = snapshot.DisplayNameRead ? repository.FindContactByName(input.AccountScope, snapshot.DisplayName) : null;
+                // 强制模式不以未经核对的标题读取或绑定联系人及其历史。
+                var contact = !forceGeneration && snapshot.DisplayNameRead ? repository.FindContactByName(input.AccountScope, snapshot.DisplayName) : null;
                 run.Record.ContactId = contact?.Id;
                 run.Record.ContactReused = contact is not null;
                 run.Record.Relationship = contact?.Relationship ?? "unknown";
                 run.Record.IdentityLabel = contact?.IdentityLabel;
-                var recent = snapshot.DisplayNameRead
-                    ? repository.RecentGreetings(input.AccountScope, contact?.Id, snapshot.DisplayName, input.Scene, false, token) : [];
+                var recent = !forceGeneration && snapshot.DisplayNameRead
+                    ? RecentGreetings(input.AccountScope, contact?.Id, snapshot.DisplayName, input.Scene, token) : [];
                 var context = new GreetingGenerationContext(recent);
-                var captures = new List<Capture>();
+                const int maxCaptures = DraftRules.MaxContextCaptures;
+                var captures = new List<Capture>(maxCaptures);
                 Save(run);
-                var key = protector.Unprotect(input.ProtectedApiKey);
-                for (var round = 0; round < 4; round++)
+                for (var round = 0; round < maxCaptures; round++)
                 {
                     token.ThrowIfCancellationRequested();
-                    if (!await adapter.IsUnchangedAsync(snapshot, token)) throw Changed(run);
-                    Report("采集上下文", round == 0 ? "采集当前聊天必要区域，保留原始草稿" : $"补充上下文 {round}/3", 15 + round * 12);
+                    // DirectAppend 首帧由视觉适配器核对/冻结，不能提前要求不存在的原稿基线。
+                    if ((round != 0 || !snapshot.DirectAppend) && !await adapter.IsUnchangedAsync(snapshot, token)) throw Changed(run);
+                    Report("采集上下文", round == 0 ? "采集当前聊天必要区域；预填由适配器执行草稿保护" : $"采集上滚后的消息区 {round + 1}/{maxCaptures}", 15 + round * 6);
                     var capture = await adapter.CaptureAsync(snapshot, round, token);
-                    if (!snapshot.DisplayNameRead) capture = capture with { RequiresConversationCheck = true };
-                    if (snapshot.TitleSource == "ocr" && capture.LocalTitle is null)
-                        capture = capture with { LocalTitle = snapshot.DisplayName };
-                    if (capture.LocalTitle is { } localTitle)
+                    if (forceGeneration)
+                        capture = capture with { ForceGeneration = true, RequiresConversationCheck = false, LocalTitle = null };
+                    else
                     {
-                        if (DraftRules.LooksLikeGroupTitle(localTitle)) throw new GroupChatDetectedException();
-                        if (snapshot.DisplayNameRead && localTitle.Trim() != snapshot.DisplayName.Trim())
+                        if (snapshot.TitleSource == "ocr" && capture.LocalTitle is null)
+                            capture = capture with { LocalTitle = snapshot.DisplayName };
+                        if (capture.LocalTitle is { } localTitle)
                         {
-                            run.AppendBlockReason = "本地截图标题与原始会话不一致，请重新触发。";
-                            throw new InvalidDataException(run.AppendBlockReason);
+                            if (DraftRules.LooksLikeGroupTitle(localTitle)) throw new GroupChatDetectedException();
+                            if (localTitle != snapshot.DisplayName || captures.Count > 0 && localTitle != captures[0].LocalTitle)
+                            {
+                                run.AppendBlockReason = "本地截图标题与原始会话不一致，请重新触发。";
+                                throw new InvalidDataException(run.AppendBlockReason);
+                            }
                         }
+                        else if (captures.Count > 0 && captures[0].LocalTitle is not null)
+                            throw new InvalidDataException("本地聊天标题在连续截图间缺失，未上传截图。");
                     }
                     if (captures.Any(x => x.PngBytes.AsSpan().SequenceEqual(capture.PngBytes))) break;
+                    if (captures.Sum(x => (long)x.PngBytes.Length) + capture.PngBytes.Length > 12 * 1024 * 1024)
+                    {
+                        if (captures.Count == 0) throw new InvalidDataException("消息截图超过 12 MiB。");
+                        break;
+                    }
                     captures.Add(capture);
                     run.Record.CaptureCount = captures.Count;
                     run.Record.GenerationStatus = "进行中";
                     Save(run);
-                    if (!await adapter.IsUnchangedAsync(snapshot, token)) throw Changed(run);
-                    Report("提取称呼", $"正在请求 {input.Model} · {captures.Count} 张截图", 35 + round * 10);
-                    run.Session = await service.ExtractAsync(input, key, captures, contact, context, token);
-                    CheckTitle(run);
-                    if (run.Session.Extraction.Basis != "unknown" || contact?.Confirmed == true || round == 3 || !adapter.CanCollectMoreContext) break;
-                    if (!await adapter.IsUnchangedAsync(snapshot, token)) throw Changed(run);
-                    if (!await adapter.ScrollUpAsync(snapshot, token)) break;
+                    if (round + 1 == maxCaptures || !adapter.CanCollectMoreContext || !await adapter.ScrollUpAsync(snapshot, token)) break;
                     run.Record.ScrollCount++;
                 }
-                if (run.Session is null) throw new InvalidDataException("未获得可用的称呼提取结果。");
+                token.ThrowIfCancellationRequested();
+                Report("提取称呼", $"正在请求 {input.Model} · {captures.Count} 张截图", 35);
+                // 采集顺序完全复用上游策略：先完成有限采集，再一次性提取，不按模型称呼结果继续滚动。
+                run.Session = await service.ExtractAsync(input, protector.Unprotect(input.ProtectedApiKey), captures, contact, context, token);
+                CheckTitle(run);
                 if (run.Session.Extraction.Basis == "unknown" && contact?.Confirmed != true)
                 {
                     run.Record.GenerationStatus = "待确认称呼";
@@ -219,15 +231,17 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
             if (run.WriteAttempted || run.Record.AppendAttemptId is not null)
                 throw new InvalidOperationException("本次已尝试预填，不能重试或重放；请人工检查微信。");
             if (!run.InputSettings.EnableLiveAppend) throw new InvalidOperationException("触发任务时预填未启用，本次只能复制正文。");
-            if (snapshot is not { DisplayNameRead: true, OriginalTextRead: true } || !adapter.CanAutoAppend)
-                throw new InvalidOperationException(adapter.AutoAppendUnavailableReason.Length > 0 ? adapter.AutoAppendUnavailableReason : "没有独立标题及完整原文基线，本次只能复制。");
+            if (snapshot is { ForceGeneration: true })
+                throw new InvalidOperationException("强制生成没有独立核对聊天身份，本次仅可复制；不能向未经核对的聊天写入。");
+            if (snapshot is not { DisplayNameRead: true } || (!snapshot.OriginalTextRead && !snapshot.DirectAppend) || !adapter.CanAutoAppend)
+                throw new InvalidOperationException(adapter.AutoAppendUnavailableReason.Length > 0 ? adapter.AutoAppendUnavailableReason : "没有独立标题及完整原文或适配器直接追加能力，本次只能复制。");
             if (run.AppendBlockReason.Length > 0) throw new InvalidDataException(run.AppendBlockReason);
             CheckIndex(run, run.SelectedIndex);
             UpdateSelected(run);
             ValidateSelected(run.Record.Greeting, run.InputSettings.Scene);
             CheckTitle(run);
             if (run.AppendBlockReason.Length > 0) throw new InvalidDataException(run.AppendBlockReason);
-            Report("核对输入", "核对最初的会话、焦点和完整草稿，不建立新基线", 90);
+            Report("核对输入", snapshot.DirectAppend ? "由原适配器核对目标聊天、输入位置及草稿保护，不建立新会话基线" : "核对最初的会话、焦点和完整草稿，不建立新基线", 90);
             if (!await adapter.WaitForAppendReadyAsync(snapshot, token) || !await adapter.IsUnchangedAsync(snapshot, token)) throw Changed(run);
             if (run.Expired)
             {
@@ -373,6 +387,14 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
     {
         var snapshot = run.Snapshot!;
         var session = run.Session!;
+        if (snapshot.ForceGeneration)
+        {
+            // 强制模式只生成供人工复制；模型读到的名称不能升级为独立身份或写入许可。
+            run.Record.ObservedDisplayName = null;
+            run.Record.ScreenshotRecipientMatched = null;
+            run.AppendBlockReason = "强制生成跳过身份核对，本次仅可复制；请重新触发普通模式后再预填。";
+            return;
+        }
         var localTitles = session.InputCaptures.Where(x => x.LocalTitle is not null).Select(x => x.LocalTitle!).Distinct(StringComparer.Ordinal).ToArray();
         var title = snapshot.TitleSource == "ocr" ? snapshot.DisplayName : session.Extraction.ObservedDisplayName;
         run.Record.ObservedDisplayName = title;
@@ -401,7 +423,7 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
         if (string.IsNullOrWhiteSpace(text) || text.Length > 2000 || text.Any(char.IsControl) || text.Contains('`') || text.Contains("**", StringComparison.Ordinal) ||
             Regex.IsMatch(text, @"\{[^{}]*\}|\[[^\[\]]*(称呼|姓名|场景)[^\[\]]*\]"))
             throw new InvalidDataException("选中正文包含空白、控制字符、格式标记或未替换变量，不能预填。");
-        DraftRules.ValidateSceneGreeting(text, scene);
+        ThirdVersionValidation.ValidateSceneGreeting(text, scene);
     }
 
     private async Task ReleaseCoreAsync(ThirdVersionRun run)
@@ -461,6 +483,27 @@ public sealed class ThirdVersionWorkflow(LocalRepository repository, ISecretProt
         run.Record.AutomationMethod = run.Adapter.AutomationMethod;
         run.Record.FallbackReason = run.Adapter.FallbackReason;
         run.Record.LayoutApiCallCount = run.Adapter.LayoutApiCallCount;
+    }
+
+    private IReadOnlyList<string> RecentGreetings(string scope, string? contactId, string displayName, string scene, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (string.IsNullOrWhiteSpace(displayName)) return [];
+        // 上游移除了通用去重 API；仅第三版提示词保留旧的近期上下文窗口。
+        var batch = repository.ReadHistoryBatch(scope, null, 200, ct);
+        var recent = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var task in batch.Records)
+        {
+            ct.ThrowIfCancellationRequested();
+            var sameContact = !string.IsNullOrEmpty(contactId) && !string.IsNullOrEmpty(task.ContactId)
+                ? task.ContactId == contactId : task.DisplayName.Trim() == displayName.Trim();
+            if (!sameContact || task.IsDemo || task.Scene.Trim() != scene.Trim() ||
+                task.GenerationStatus != "成功" || string.IsNullOrWhiteSpace(task.Greeting)) continue;
+            if (seen.Add(GreetingDiversity.Normalize(task.Greeting))) recent.Add(task.Greeting);
+            if (recent.Count == 5) break;
+        }
+        return recent;
     }
 
     private void Save(ThirdVersionRun run) => repository.SaveTask(run.Record);

@@ -68,36 +68,82 @@ internal static class LocalVisionChecks
             var repo = new LocalRepository(Path.Combine(root, "emoji-" + Guid.NewGuid().ToString("N")), protector);
             const string title = "测试好友🎀-研发部";
             repo.SaveContact(new Contact { DisplayName = title, RemarkName = title, Confirmed = true, AddressTerm = "陈老师", AddressTermSource = "user" });
-            var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                 AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-            var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             var model = new FakeModel { Response = new() { ObservedDisplayName = title, ConversationType = "single",
                 GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "成功" || result.DisplayName != title || result.ScreenshotRecipientMatched is not null ||
                 result.ContactId is not null || result.ContactReused || model.LastContact is not null || adapter.Appends != 0 || result.AppendAttemptId is not null)
                 throw new Exception("A model-read title was blocked by OCR or treated as independent identity.");
             if (repo.Contacts("default").Count != 1 || repo.Contacts("default")[0].AddressTerm != "陈老师")
                 throw new Exception("Read-only visual analysis mutated a saved contact.");
-            adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             model.Response = model.Response with { ConversationType = "unknown" };
-            result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "成功" || model.Calls != 2 || adapter.Appends != 0 || repo.Contacts("default").Count != 1)
                 throw new Exception("A model type blocked a title without a group suffix, or granted write access.");
         });
         yield return ("An adapter cannot authorize input from a snapshot without an independently read title", async () =>
         {
             var repo = new LocalRepository(Path.Combine(root, "title-" + Guid.NewGuid().ToString("N")), protector);
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
+                AuthorizedOrigin = "https://test.example", EnableLiveAppend = true };
             foreach (var originalRead in new[] { false, true })
             {
                 var adapter = new FakeAdapter { CanAutoAppend = true, DisplayNameRead = false, OriginalTextRead = originalRead };
                 var model = new FakeModel();
-                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(new AppSettings { DemoMode = true, Scene = "生日" }, adapter, model, null, default);
-                if (result!.GenerationStatus != "失败" || model.Calls != 0 || adapter.Appends != 0)
+                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
+                if (result!.GenerationStatus != "失败" || !result.Error.Contains("独立读取聊天标题") ||
+                    model.Calls != 0 || adapter.Appends != 0)
                     throw new Exception("A missing independent title granted write capability.");
             }
+        });
+        yield return ("Explicit force generation collects the same context without titles and appends only when ready", async () =>
+        {
+            var repo = new LocalRepository(Path.Combine(root, "force-" + Guid.NewGuid().ToString("N")), protector);
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
+                AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = false };
+            var response = JsonSerializer.Serialize(new ModelResponse { GreetingText = "生日快乐，愿你新的一岁平安顺心！" });
+            var expectedCaptures = 0;
+            var handler = new StubHandler(request =>
+            {
+                using var json = JsonDocument.Parse(request.Content!.ReadAsStringAsync().GetAwaiter().GetResult());
+                var content = json.RootElement.GetProperty("messages")[1].GetProperty("content");
+                using var instruction = JsonDocument.Parse(content[0].GetProperty("text").GetString()!);
+                var images = content.EnumerateArray().Where(item => item.GetProperty("type").GetString() == "image_url")
+                    .Select(item => item.GetProperty("image_url").GetProperty("url").GetString());
+                var expectedImages = Enumerable.Range(0, expectedCaptures)
+                    .Select(index => "data:image/png;base64," + Convert.ToBase64String([(byte)index]));
+                if (!instruction.RootElement.GetProperty("skip_title_check").GetBoolean() ||
+                    instruction.RootElement.GetProperty("check_title_group_suffix").GetBoolean() ||
+                    instruction.RootElement.GetProperty("recipient_checked_locally").GetBoolean() ||
+                    !images.SequenceEqual(expectedImages))
+                    throw new Exception("Forced generation requested a title check or sent unexpected context.");
+                return new HttpResponseMessage(HttpStatusCode.OK) { Content = new StringContent(JsonSerializer.Serialize(new
+                    { choices = new[] { new { message = new { content = response } } } })) };
+            });
+            using var model = new CompatibleModelClient(handler);
+            var coordinator = new TaskCoordinator(repo, examples, protector);
+            foreach (var (ready, canScroll) in new[] { (true, true), (false, true), (true, false) })
+            {
+                expectedCaptures = canScroll ? 3 : 1;
+                var adapter = new FakeAdapter { AutomationMethod = "vision", TitleSource = "none",
+                    DisplayNameRead = false, DisplayName = "", OriginalTextRead = false, DirectAppend = true,
+                    ForceGeneration = true, CanCollectMoreContext = canScroll, WaitForAppend = _ => Task.FromResult(ready) };
+                var task = await coordinator.RunAsync(configuration, adapter, model, default);
+                if (task is null || task.GenerationStatus != "成功" || task.DisplayName != "强制生成" ||
+                    task.ObservedDisplayName is not null || task.ContactId is not null || task.ScreenshotRecipientMatched is not null ||
+                    task.CaptureCount != expectedCaptures || adapter.Scrolls != expectedCaptures - 1 ||
+                    adapter.Appends != (ready ? 1 : 0) ||
+                    (task.AppendAttemptId is not null) != ready)
+                    throw new Exception("Forced generation wrote without readiness, required a title, or claimed a verified contact.");
+            }
+            if (handler.Calls != 3 || repo.Contacts(configuration.AccountScope).Count != 0)
+                throw new Exception("Forced generation retried or changed contact records.");
         });
         yield return ("Local OCR reconstructs CJK spacing without deleting real spaces in titles", () =>
         {
@@ -113,13 +159,13 @@ internal static class LocalVisionChecks
             foreach (var type in new[] { "single", "unknown", "group", "service" })
             {
                 var repo = new LocalRepository(Path.Combine(root, "local-" + Guid.NewGuid().ToString("N")), protector);
-                var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+                var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                     AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-                var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+                var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                     DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false, RequiresConversationCheck = true };
                 var model = new FakeModel { Response = new() { ObservedDisplayName = "测试联系人", ConversationType = type,
                     GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+                var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
                 if (result!.GenerationStatus != "成功" || model.Calls != 1 || adapter.Appends != 0 ||
                     adapter.Scrolls != 0 || result.AppendAttemptId is not null || result.LayoutApiCallCount != 0 || result.ScreenshotRecipientMatched is not null)
                     throw new Exception("Local visual semantics or read-only permissions were bypassed.");
@@ -145,9 +191,191 @@ internal static class LocalVisionChecks
                 if (layout.ConversationType != "unknown" || layout.DraftKind != "unknown" || !layout.Uncertain)
                     throw new Exception("Geometry is not semantic proof.");
                 MustReject(() => VisionRules.Validate(layout));
-                var result = await adapter.AppendAsync(new("s", "n", "draft", "w", false), "祝福", default);
+                var result = await adapter.AppendAsync(new("s", "n", "draft", "w"), "祝福", default);
                 if (result.Status != "待手动处理") throw new Exception("A visual result authorized a write.");
             }
+        });
+        yield return ("Local visual layout remembers a confirmed theme per window and recovers after it changes", () =>
+        {
+            var window = Guid.NewGuid().ToString("N");
+            var reads = 0;
+            WechatToolbarTheme ReadTheme() { reads++; return WechatToolbarTheme.Dark; }
+            using var light = TemplateLocatorChecks.Fixture(192, false, WechatToolbarTheme.Light);
+            MustReject(() => WechatLocalLayout.Locate(light, 192, default, window, ReadTheme));
+            using (var graphics = Graphics.FromImage(light))
+                graphics.DrawLine(Pens.Gray, 300, 450, light.Width - 5, 450);
+            _ = WechatLocalLayout.Locate(light, 192, default, window, ReadTheme);
+            _ = WechatLocalLayout.Locate(light, 192, default, window, ReadTheme);
+            using var dark = Fixture(192, false);
+            _ = WechatLocalLayout.Locate(dark, 192, default, window, ReadTheme);
+            _ = WechatLocalLayout.Locate(dark, 192, default, Guid.NewGuid().ToString("N"), ReadTheme);
+            if (reads != 3) throw new Exception("Theme hints must be read for new windows and cached only after valid geometry.");
+            return Task.CompletedTask;
+        });
+        yield return ("Local layout follows a left-shifted toolbar and a tall editor across window widths", () =>
+        {
+            const uint dpi = 144;
+            const int toolbarX = 112, chatLeft = 88, separator = 215;
+            foreach (var width in new[] { 636, 838 })
+            foreach (var theme in new[] { WechatToolbarTheme.Dark, WechatToolbarTheme.Light })
+            {
+                using var image = TemplateLocatorChecks.Fixture(dpi, false, theme, width, width - 216, toolbarX);
+                using (var graphics = Graphics.FromImage(image))
+                    graphics.DrawLine(Pens.Gray, chatLeft, separator, width - 12, separator);
+
+                var (layout, anchors) = WechatLocalLayout.Locate(image, dpi, default, readWindowsTheme: () => theme);
+                if (Math.Abs(anchors.BottomToolbar.X * width / 1000 - toolbarX) > 1 ||
+                    Math.Abs(layout.Chat!.X * width / 1000 - chatLeft) > 1 ||
+                    Math.Abs(layout.Input!.Y * image.Height / 1000 - separator) > 1 ||
+                    !layout.Input.Contains(layout.Editor!) || !layout.Input.Contains(layout.InputToolbar!))
+                    throw new Exception($"The left-shifted layout was incorrect at {width} px in {theme} theme.");
+            }
+            return Task.CompletedTask;
+        });
+        yield return ("Local layout finds a tall editor boundary above two fifths of the window", () =>
+        {
+            const int separator = 310;
+            using var image = Fixture(192, false, separator);
+            var (layout, _) = WechatLocalLayout.Locate(image, 192, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - separator) > 1 ||
+                layout.Messages!.Bottom >= layout.Input.Y || !layout.Input.Contains(layout.Editor!))
+                throw new Exception("The input boundary or its derived regions were incorrect.");
+            return Task.CompletedTask;
+        });
+        yield return ("An image against the input divider does not prevent layout and write-time geometry checks", () =>
+        {
+            const int separator = 450;
+            using var initial = Fixture(192, false, separator);
+            using var withImage = (Bitmap)initial.Clone();
+            using (var graphics = Graphics.FromImage(withImage))
+                graphics.FillRectangle(Brushes.White, 435, 380, 155, separator - 380);
+
+            var (layout, anchors) = WechatLocalLayout.Locate(initial, 192, default);
+            var (recovered, _) = WechatLocalLayout.Locate(withImage, 192, default);
+            if (recovered.Input!.Y != layout.Input!.Y ||
+                !WechatLocalLayout.CanReuseGeometry(initial, withImage, 192, layout, anchors, default))
+                throw new Exception("A message image moved or hid the divider during layout checks.");
+            return Task.CompletedTask;
+        });
+        yield return ("A short message edge cannot stand in for the input divider", () =>
+        {
+            using var image = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(image))
+                graphics.DrawLine(Pens.Gray, 430, 450, 980, 450);
+            MustReject(() => WechatLocalLayout.Locate(image, 192, default));
+            return Task.CompletedTask;
+        });
+        yield return ("Both editor corners recover the divider when a wide message hides the upper reference", () =>
+        {
+            const int y = 450, left = 332, right = 1072;
+            using var lineOnly = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(lineOnly))
+            {
+                graphics.FillRectangle(Brushes.White, 410, 380, 550, y - 380);
+                graphics.DrawLine(Pens.Gray, left + 16, y, right - 16, y);
+            }
+            MustReject(() => WechatLocalLayout.Locate(lineOnly, 192, default));
+
+            using var framed = (Bitmap)lineOnly.Clone();
+            using (var graphics = Graphics.FromImage(framed))
+            {
+                foreach (var (edge, inward) in new[] { (left, 1), (right, -1) })
+                {
+                    graphics.DrawLines(Pens.Gray, new Point[] { new(edge + inward * 16, y),
+                        new(edge + inward * 3, y + 6), new(edge, y + 12), new(edge, y + 70) });
+                }
+            }
+            var (layout, _) = WechatLocalLayout.Locate(framed, 192, default);
+            if (Math.Abs(layout.Input!.Y * framed.Height / 1000 - y) > 1)
+                throw new Exception("The recovered divider does not align with the top of the editor.");
+            return Task.CompletedTask;
+        });
+        yield return ("Antialiased editor corners recover the divider when a message touches its upper edge", () =>
+        {
+            const uint dpi = 144;
+            const int y = 450, left = 326, right = 1088;
+            var topTone = Color.FromArgb(49, 49, 49);
+            var sideTone = Color.FromArgb(53, 53, 53);
+            using var image = TemplateLocatorChecks.Fixture(dpi, false);
+            using (var graphics = Graphics.FromImage(image))
+            using (var pen = new Pen(topTone))
+            using (var sidePen = new Pen(sideTone))
+            {
+                graphics.FillRectangle(Brushes.White, 400, 380, 540, y - 380);
+                graphics.DrawLine(pen, left + 20, y, right - 20, y);
+                graphics.DrawLine(sidePen, left + 12, y + 12, left + 12, y + 40);
+                graphics.DrawLine(sidePen, right - 8, y + 12, right - 8, y + 40);
+            }
+            image.SetPixel(left + 16, y + 4, sideTone);
+            image.SetPixel(right - 8, y + 4, topTone);
+            MustReject(() => WechatLocalLayout.Locate(image, dpi, default));
+
+            image.SetPixel(right - 9, y + 4, sideTone);
+            var (layout, _) = WechatLocalLayout.Locate(image, dpi, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - y) > 1)
+                throw new Exception("The antialiased editor corner moved the divider.");
+            return Task.CompletedTask;
+        });
+        yield return ("A two-pixel corner at 100 percent scaling recovers an obscured input divider", () =>
+        {
+            const int y = 450, left = 343, right = 1083;
+            using var image = TemplateLocatorChecks.Fixture(96, false);
+            using (var graphics = Graphics.FromImage(image))
+            {
+                graphics.FillRectangle(Brushes.White, 410, 400, 550, y - 400);
+                graphics.DrawLine(Pens.Gray, left + 8, y, right - 8, y);
+                foreach (var (edge, inward) in new[] { (left, 1), (right, -1) })
+                {
+                    var outer = Math.Min(edge, edge + inward);
+                    graphics.FillRectangle(Brushes.Gray, outer, y + 6, 2, 40);
+                    graphics.FillRectangle(Brushes.Gray, outer + inward * 3, y + 3, 2, 1);
+                }
+            }
+            var (layout, _) = WechatLocalLayout.Locate(image, 96, default);
+            if (Math.Abs(layout.Input!.Y * image.Height / 1000 - y) > 1)
+                throw new Exception("The recovered boundary is outside the input divider.");
+            return Task.CompletedTask;
+        });
+        yield return ("Multiple separated partial divider candidates are rejected as ambiguous", () =>
+        {
+            using var image = TemplateLocatorChecks.Fixture(192, false);
+            using (var graphics = Graphics.FromImage(image))
+            {
+                foreach (var y in new[] { 430, 510 })
+                {
+                    graphics.FillRectangle(Brushes.White, 435, y - 30, 155, 30);
+                    graphics.DrawLine(Pens.Gray, 300, y, image.Width - 5, y);
+                }
+            }
+            MustReject(() => WechatLocalLayout.Locate(image, 192, default));
+            return Task.CompletedTask;
+        });
+        yield return ("Visual scrolling rematches changed toolbar pixels without accepting a moved input boundary", () =>
+        {
+            using var initial = Fixture(192, false);
+            var (layout, anchors) = WechatLocalLayout.Locate(initial, 192, default);
+            var frame = new VisionWindowFrame(new(0, 0, initial.Width, initial.Height), 192);
+            bool CanReuse(Bitmap current) => WechatLocalLayout.CanReuseGeometry(initial, current, 192, layout, anchors, default);
+            using var newMessage = (Bitmap)initial.Clone();
+            var messages = frame.ToClientRectangle(layout.Messages!);
+            newMessage.SetPixel(messages.X + messages.Width / 2, messages.Y + 10, Color.Magenta);
+            if (!CanReuse(newMessage)) throw new Exception("A message pixel changed the confirmed toolbar geometry.");
+            foreach (var box in new[] { anchors.TopToolbar, anchors.BottomToolbar })
+            {
+                using var changed = (Bitmap)initial.Clone();
+                var region = frame.ToClientRectangle(box);
+                changed.SetPixel(region.X + region.Width / 2, region.Y + region.Height / 2, Color.Magenta);
+                if (CanReuse(changed)) throw new Exception("A changed toolbar reused the original geometry.");
+                if (!WechatLocalLayout.ConfirmMessageGeometry(initial, changed, frame, layout, anchors, default))
+                    throw new Exception("The message crop was rejected after local rematching confirmed the same geometry.");
+            }
+            using var movedSeparator = Fixture(192, false, 420);
+            using var noSeparator = TemplateLocatorChecks.Fixture(192, false);
+            if (CanReuse(movedSeparator) || CanReuse(noSeparator))
+                throw new Exception("The old input bounds were used without confirming the current divider.");
+            if (WechatLocalLayout.ConfirmMessageGeometry(initial, movedSeparator, frame, layout, anchors, default))
+                throw new Exception("Local rematching accepted an old crop after the input divider moved.");
+            return Task.CompletedTask;
         });
         yield return ("Missing or ambiguous local anchors stop without a remote layout request", async () =>
         {
@@ -171,7 +399,7 @@ internal static class LocalVisionChecks
             try { await adapter.LocateFrozenAsync(image, 192, cancellation.Token); throw new Exception("A cancelled search continued."); }
             catch (OperationCanceledException) { }
         });
-        yield return ("Local crops exclude the contact list and entire input panel", () =>
+        yield return ("Local generation uses the original message crop without title, input or padding", () =>
         {
             using var image = Fixture(192, false);
             var result = WechatLocalLayout.Locate(image, 192, default);
@@ -181,9 +409,13 @@ internal static class LocalVisionChecks
             using var graphics = Graphics.FromImage(image);
             graphics.FillRectangle(Brushes.Magenta, 0, 0, messages.Left - 2, image.Height);
             graphics.FillRectangle(Brushes.Magenta, input);
+            graphics.FillRectangle(Brushes.Magenta, frame.ToClientRectangle(result.Layout.Header!));
+            graphics.FillRectangle(Brushes.Lime, messages.Left, messages.Top, 6, 6);
             graphics.Flush();
             var capture = VisionContextSnapshot.CreateCapture(image, frame, result.Layout, 0);
             using var stream = new MemoryStream(capture.PngBytes); using var crop = new Bitmap(stream);
+            if (crop.Size != messages.Size || crop.GetPixel(0, 0).ToArgb() != Color.Lime.ToArgb())
+                throw new Exception("The message crop was scaled, shifted or padded.");
             for (var y = 0; y < crop.Height; y += 3)
                 for (var x = 0; x < crop.Width; x += 3)
                     if (crop.GetPixel(x, y).ToArgb() == Color.Magenta.ToArgb()) throw new Exception("Private neighboring pixels entered the model crop.");
@@ -227,11 +459,11 @@ internal static class LocalVisionChecks
             foreach (var source in new[] { "ocr", "uia" })
             {
                 var repository = new LocalRepository(Path.Combine(root, "group-preflight-" + Guid.NewGuid().ToString("N")), protector);
-                var adapter = new FakeAdapter { IsDemo = false, DisplayName = "测试群 （1 12）", TitleSource = source };
+                var adapter = new FakeAdapter { DisplayName = "测试群 （1 12）", TitleSource = source };
                 var model = new FakeModel();
-                var configuration = new AppSettings { DemoMode = false, Model = "fake", Scene = "生日", EnableLiveAppend = true,
+                var configuration = new AppSettings { Model = "fake", Scene = "生日", EnableLiveAppend = true,
                     BaseUrl = "https://test.example/v1", AuthorizedOrigin = "https://test.example" };
-                var result = await new TaskCoordinator(repository, examples, protector).RunAsync(configuration, adapter, model, null, default);
+                var result = await new TaskCoordinator(repository, examples, protector).RunAsync(configuration, adapter, model, default);
                 if (model.Calls != 0 || result!.ApiCallCount != 0 || result.GenerationStatus != "失败" || result.Greeting.Length != 0 ||
                     adapter.Appends != 0 || result.AppendAttemptId is not null || repository.Contacts("default").Count != 0 || !result.Error.Contains("群聊"))
                     throw new Exception("Group title reached generation or input before validation.");
@@ -240,13 +472,13 @@ internal static class LocalVisionChecks
         yield return ("Detected group-title counts stop once without retrying or saving a contact", async () =>
         {
             var repo = new LocalRepository(Path.Combine(root, "suffix-" + Guid.NewGuid().ToString("N")), protector);
-            var configuration = new AppSettings { DemoMode = false, Scene = "生日", BaseUrl = "https://test.example/v1",
+            var configuration = new AppSettings { Scene = "生日", BaseUrl = "https://test.example/v1",
                 AuthorizedOrigin = "https://test.example", Model = "fake", EnableLiveAppend = true };
-            var adapter = new FakeAdapter { IsDemo = false, CanAutoAppend = false, OriginalTextRead = false,
+            var adapter = new FakeAdapter { CanAutoAppend = false, OriginalTextRead = false,
                 DisplayNameRead = false, DisplayName = "", CanCollectMoreContext = false };
             var model = new FakeModel { Response = new() { ObservedDisplayName = "测试群(242)", ConversationType = "single",
                 GreetingText = "生日快乐！愿你新的一岁平安顺心，每个平常的日子里都有值得期待的小事。" } };
-            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, null, default);
+            var result = await new TaskCoordinator(repo, examples, protector).RunAsync(configuration, adapter, model, default);
             if (result!.GenerationStatus != "失败" || !result.Error.Contains("括号人数大于 2") || model.Calls != 1 ||
                 adapter.Appends != 0 || result.AppendAttemptId is not null || repo.Contacts("default").Count != 0)
                 throw new Exception("Group suffix retried, created a contact, or granted write access.");
@@ -260,11 +492,11 @@ internal static class LocalVisionChecks
         public Task<string> ReadAsync(Bitmap titleImage, CancellationToken cancellationToken) => Task.FromResult("title-" + ++_calls);
     }
 
-    private static Bitmap Fixture(uint dpi, bool toolbarAtTop)
+    private static Bitmap Fixture(uint dpi, bool toolbarAtTop, int? separatorY = null)
     {
         var image = TemplateLocatorChecks.Fixture(dpi, false);
         using var graphics = Graphics.FromImage(image); using var pen = new Pen(Color.Gray);
-        var separator = toolbarAtTop ? 610 - (int)(20 * dpi / 96d) : 450;
+        var separator = separatorY ?? (toolbarAtTop ? 610 - (int)(20 * dpi / 96d) : 450);
         graphics.DrawLine(pen, 300, separator, image.Width - 5, separator);
         return image;
     }

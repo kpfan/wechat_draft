@@ -6,6 +6,7 @@ using WechatDraft.Core.ThirdVersion;
 
 internal static class ThirdVersionWorkflowChecks
 {
+    private const int MaxContextCaptures = 3;
     private static readonly string[] Greetings =
     [
         "周老师，新春快乐！愿新的一年工作有清晰方向，生活多些轻松自在，忙碌之余也能安心吃饭、踏实休息，和家人共享温暖时光。[庆祝][福]",
@@ -23,7 +24,8 @@ internal static class ThirdVersionWorkflowChecks
         {
             await using var f = new Fixture(root, protector);
             var run = await f.StartAsync();
-            Equal(1, f.Adapter.Begins); Equal(1, f.Adapter.Captures); Equal(0, f.Adapter.Scrolls);
+            Equal(1, f.Adapter.Begins); Equal(MaxContextCaptures, f.Adapter.Captures);
+            Equal(MaxContextCaptures - 1, f.Adapter.Scrolls);
             Equal(3, run.Session!.Candidates.Count); Equal(2, run.Record.ApiCallCount); Equal(2, f.Handler.Calls);
             Equal(-1, run.SelectedIndex); Equal(0, f.Adapter.Appends); Equal(" 原有草稿\r\n", f.Adapter.CurrentDraft);
             f.Workflow.Select(run, 1);
@@ -51,12 +53,14 @@ internal static class ThirdVersionWorkflowChecks
             await f.Workflow.AppendSelectedAsync(run, default);
             Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
         });
-        yield return ("Third-version workflow unknown address collects at most four distinct frames and pauses without generation", async () =>
+        yield return ("Third-version workflow collects the upstream bounded context before one unknown extraction and pauses without generation", async () =>
         {
             await using var f = new Fixture(root, protector, unknownExtractions: int.MaxValue);
             var run = await f.StartAsync();
-            Equal(4, f.Adapter.Captures); Equal(3, f.Adapter.Scrolls); Equal(4, f.Handler.Extractions); Equal(0, f.Handler.Generations);
-            Equal(4, run.Record.CaptureCount); Equal(3, run.Record.ScrollCount); Equal(4, run.Record.ApiCallCount);
+            Equal(MaxContextCaptures, f.Adapter.Captures); Equal(MaxContextCaptures - 1, f.Adapter.Scrolls);
+            Equal(1, f.Handler.Extractions); Equal(0, f.Handler.Generations);
+            Equal(MaxContextCaptures, run.Record.CaptureCount); Equal(MaxContextCaptures - 1, run.Record.ScrollCount);
+            Equal(1, run.Record.ApiCallCount);
             Equal("unknown", run.Session!.Extraction.Basis); Equal(0, run.Session.Candidates.Count); Equal(0, f.Adapter.Appends);
         });
         yield return ("Third-version workflow stops extra capture on adapter capability, failed scroll or duplicate frames", async () =>
@@ -72,12 +76,18 @@ internal static class ThirdVersionWorkflowChecks
                 Equal(1, f.Handler.Extractions); Equal(0, f.Handler.Generations); Equal(1, run.Record.CaptureCount);
             }
         });
-        yield return ("Third-version workflow stops scrolling once additional context resolves the address", async () =>
+        yield return ("Third-version workflow known address still collects the upstream context budget before the first model request", async () =>
         {
-            await using var f = new Fixture(root, protector, unknownExtractions: 1);
+            await using var f = new Fixture(root, protector);
+            f.Handler.BeforeRequest = () =>
+            {
+                Equal(MaxContextCaptures, f.Adapter.Captures);
+                Equal(MaxContextCaptures - 1, f.Adapter.Scrolls);
+            };
             var run = await f.StartAsync();
-            Equal(2, f.Adapter.Captures); Equal(1, f.Adapter.Scrolls); Equal(2, f.Handler.Extractions); Equal(1, f.Handler.Generations);
-            Equal(3, run.Record.ApiCallCount); Equal(3, run.Session!.Candidates.Count); Equal(0, f.Adapter.Appends);
+            Equal(MaxContextCaptures, run.Session!.Captures.Count);
+            Equal(1, f.Handler.Extractions); Equal(1, f.Handler.Generations);
+            Equal(2, run.Record.ApiCallCount); Equal(3, run.Session.Candidates.Count); Equal(0, f.Adapter.Appends);
         });
         yield return ("Third-version workflow unknown pause resumes with manual or explicitly neutral generation", async () =>
         {
@@ -111,22 +121,27 @@ internal static class ThirdVersionWorkflowChecks
                 True(run.Record.Error.Length > 0, "Preflight rejection was not visible.");
             }
         });
-        yield return ("Third-version workflow preserves confirmed blank contact as neutral and does not scroll or mutate contact", async () =>
+        yield return ("Third-version workflow preserves confirmed blank contact as neutral after upstream context collection without mutating contact", async () =>
         {
             await using var f = new Fixture(root, protector);
             var contact = new Contact { DisplayName = "周老师", Confirmed = true, AddressTerm = "", Relationship = "unknown", IdentityLabel = "保留档案" };
             f.Repository.SaveContact(contact); var run = await f.StartAsync();
-            Equal(1, f.Adapter.Captures); Equal(0, f.Adapter.Scrolls); Equal(3, run.Session!.Candidates.Count);
+            Equal(MaxContextCaptures, f.Adapter.Captures); Equal(MaxContextCaptures - 1, f.Adapter.Scrolls);
+            Equal(1, f.Handler.Extractions); Equal(3, run.Session!.Candidates.Count);
             True(run.Session.Neutral, "Confirmed blank contact was not generated neutrally.");
             True(run.Session.Candidates.All(x => !x.StartsWith("周老师", StringComparison.Ordinal)), "Neutral output invented an address.");
             var saved = f.Repository.Contacts("default").Single(); Equal("", saved.AddressTerm); Equal("unknown", saved.Relationship); Equal("保留档案", saved.IdentityLabel);
         });
-        yield return ("Third-version workflow non-OCR model title mismatch retains candidates without write permission", async () =>
+        yield return ("Third-version workflow non-OCR model title mismatch retains candidates without write permission even with DirectAppend", async () =>
         {
-            await using var f = new Fixture(root, protector); f.Handler.ModelTitle = "其他联系人";
-            var run = await f.StartAsync(); Equal(3, run.Session!.Candidates.Count); f.Workflow.Select(run, 0);
-            True(!run.CanAppend, "Mismatched model title granted append permission.");
-            await f.Workflow.AppendSelectedAsync(run, default); Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
+            foreach (var directAppend in new[] { false, true })
+            {
+                await using var f = new Fixture(root, protector); f.Handler.ModelTitle = "其他联系人";
+                f.Adapter.DirectAppend = directAppend;
+                var run = await f.StartAsync(); Equal(3, run.Session!.Candidates.Count); f.Workflow.Select(run, 0);
+                True(!run.CanAppend, "Mismatched model title granted append permission.");
+                await f.Workflow.AppendSelectedAsync(run, default); Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
+            }
         });
         yield return ("Third-version workflow failed generation keeps extraction and counts both failed attempts", async () =>
         {
@@ -175,31 +190,37 @@ internal static class ThirdVersionWorkflowChecks
                 Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
             }
         });
-        yield return ("Third-version workflow canceled collection retains extraction but later generation stays copy-only", async () =>
+        yield return ("Third-version workflow canceled upstream collection never uploads partial context or retains write permission", async () =>
         {
             await using var f = new Fixture(root, protector, unknownExtractions: int.MaxValue);
             f.Adapter.CancelOnScroll = true; var run = await f.StartAsync();
-            True(run.Session is not null, "Cancellation discarded the completed extraction.");
-            Equal("unknown", run.Session!.Extraction.Basis); Equal(0, run.Session.Candidates.Count);
+            Equal<ThirdVersionSession?>(null, run.Session); Equal(0, f.Handler.Calls); Equal(0, run.Record.ApiCallCount);
+            Equal(1, f.Adapter.Captures); Equal(1, f.Adapter.Scrolls);
             True(run.IsReleased, "Cancellation kept the original baseline alive.");
             Equal(1, f.Adapter.Restores); Equal(1, f.Adapter.Disposals);
-            await f.Workflow.GenerateAsync(run, "周老师", false, default); Equal(3, run.Session.Candidates.Count);
-            f.Workflow.Select(run, 0); True(!run.CanAppend, "Generating after cancellation granted append permission.");
+            await f.Workflow.GenerateAsync(run, "周老师", false, default);
+            Equal<ThirdVersionSession?>(null, run.Session); True(!run.CanAppend, "Canceled collection granted append permission.");
             await f.Workflow.AppendSelectedAsync(run, default);
-            Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId); Equal(2, run.Record.ApiCallCount);
+            Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId); Equal(0, f.Handler.Calls);
             Equal(1, f.Adapter.Restores); Equal(1, f.Adapter.Disposals);
         });
-        yield return ("Third-version workflow append uncertainty never replays even after repeated selection", async () =>
+        yield return ("Third-version workflow ordinary and DirectAppend uncertainty never replay even after repeated selection", async () =>
         {
-            await using var f = new Fixture(root, protector); var run = await f.StartAsync(); f.Workflow.Select(run, 0);
-            f.Adapter.ThrowDuringAppend = true;
-            await f.Workflow.AppendSelectedAsync(run, default);
-            Equal(1, f.Adapter.Appends); True(run.Record.AppendAttemptId is not null, "Uncertain append lost durable intent.");
-            Equal("预填结果待确认", run.Record.FillStatus);
-            f.Adapter.ThrowDuringAppend = false;
-            try { f.Workflow.Select(run, 1); throw new Exception("An uncertain write allowed changing the persisted selected draft."); }
-            catch (InvalidOperationException) { }
-            await f.Workflow.AppendSelectedAsync(run, default); Equal(1, f.Adapter.Appends);
+            foreach (var directAppend in new[] { false, true })
+            {
+                await using var f = new Fixture(root, protector);
+                f.Adapter.DirectAppend = directAppend; f.Adapter.OriginalTextRead = !directAppend;
+                f.Adapter.TitleSource = directAppend ? "ocr" : "uia";
+                var run = await f.StartAsync(); f.Workflow.Select(run, 0);
+                f.Adapter.ThrowDuringAppend = true;
+                await f.Workflow.AppendSelectedAsync(run, default);
+                Equal(1, f.Adapter.Appends); True(run.Record.AppendAttemptId is not null, "Uncertain append lost durable intent.");
+                Equal("预填结果待确认", run.Record.FillStatus);
+                f.Adapter.ThrowDuringAppend = false;
+                try { f.Workflow.Select(run, 1); throw new Exception("An uncertain write allowed changing the persisted selected draft."); }
+                catch (InvalidOperationException) { }
+                await f.Workflow.AppendSelectedAsync(run, default); Equal(1, f.Adapter.Appends);
+            }
         });
         yield return ("Third-version workflow retains initial disabled-prefill and adapter write restrictions", async () =>
         {
@@ -213,6 +234,99 @@ internal static class ThirdVersionWorkflowChecks
                 f.Settings.EnableLiveAppend = true; run.Settings.EnableLiveAppend = true; f.Adapter.AllowAppend = true;
                 await f.Workflow.AppendSelectedAsync(run, default); Equal(0, f.Adapter.Appends);
                 Equal<string?>(null, run.Record.AppendAttemptId);
+            }
+        });
+        yield return ("Third-version workflow OCR DirectAppend uses the frozen frame and protects the current draft at explicit append", async () =>
+        {
+            await using var f = new Fixture(root, protector);
+            f.Adapter.TitleSource = "ocr"; f.Adapter.DirectAppend = true; f.Adapter.OriginalTextRead = false;
+            f.Adapter.CanCollectMore = false; f.Adapter.LiveStateAvailable = false;
+            var run = await f.StartAsync();
+            Equal(3, run.Session!.Candidates.Count); Equal(2, f.Handler.Calls); Equal(0, f.Adapter.UnchangedChecks);
+            Equal(false, run.Record.OriginalTextRead); Equal(0, run.Record.OriginalCharacters);
+            Equal("", f.Adapter.Baseline!.OriginalText); Equal(0, f.Adapter.Appends);
+            // Upstream visual append preserves the draft present at append time, not an unread generation-time baseline.
+            f.Adapter.CurrentDraft = " 用户在生成后继续编辑的草稿\r\n "; f.Adapter.LiveStateAvailable = true;
+            var currentDraft = f.Adapter.CurrentDraft;
+            f.Workflow.Select(run, 1); True(run.CanAppend, "OCR deferred-draft append was incorrectly made copy-only.");
+            f.Adapter.BeforeAppend = snapshot =>
+            {
+                True(ReferenceEquals(f.Adapter.Baseline, snapshot), "Direct append replaced the original adapter capability.");
+                Equal("", snapshot.OriginalText); Equal(currentDraft, f.Adapter.CurrentDraft);
+                var stored = f.Repository.History("default").Single(x => x.Id == run.Record.Id);
+                Equal("写入中", stored.FillStatus); True(stored.AppendAttemptId is not null, "Direct append lacked durable intent.");
+            };
+            await f.Workflow.AppendSelectedAsync(run, default);
+            Equal(1, f.Adapter.Appends); Equal(DraftRules.Append(currentDraft, Greetings[1]), f.Adapter.CurrentDraft);
+            Equal("已预填", run.Record.FillStatus); Equal<bool?>(null, run.Record.OriginalPreserved);
+            await f.Workflow.AppendSelectedAsync(run, default); Equal(1, f.Adapter.Appends);
+        });
+        yield return ("Third-version workflow OCR DirectAppend still requires current target and focus before durable intent", async () =>
+        {
+            foreach (var change in new[] { "identity", "title", "focus" })
+            {
+                await using var f = new Fixture(root, protector);
+                f.Adapter.TitleSource = "ocr"; f.Adapter.DirectAppend = true; f.Adapter.OriginalTextRead = false;
+                var run = await f.StartAsync(); f.Workflow.Select(run, 0);
+                if (change == "identity") f.Adapter.CurrentIdentity = "other-window";
+                else if (change == "title") f.Adapter.Title = "其他联系人";
+                else f.Adapter.Ready = false;
+                await f.Workflow.AppendSelectedAsync(run, default);
+                Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
+                True(!run.CanAppend, "A failed current-target check retained append permission.");
+            }
+        });
+        yield return ("Third-version workflow ordinary missing identity stops before capture or model HTTP even with DirectAppend", async () =>
+        {
+            await using var f = new Fixture(root, protector);
+            f.Adapter.TitleSource = "none"; f.Adapter.DisplayNameRead = false;
+            f.Adapter.OriginalTextRead = false; f.Adapter.DirectAppend = true;
+            var run = await f.StartAsync();
+            Equal(0, f.Adapter.Captures); Equal(0, f.Handler.Calls); Equal(0, f.Adapter.Appends);
+            Equal<string?>(null, run.Record.AppendAttemptId); True(run.Record.Error.Length > 0, "Missing identity was not rejected visibly.");
+        });
+        yield return ("Third-version workflow ordinary unread draft without DirectAppend cannot capture or authorize input", async () =>
+        {
+            await using var f = new Fixture(root, protector); f.Adapter.OriginalTextRead = false;
+            var run = await f.StartAsync();
+            Equal(0, f.Adapter.Captures); Equal(0, f.Handler.Calls); Equal(0, f.Adapter.Appends);
+            Equal<string?>(null, run.Record.AppendAttemptId); True(!run.CanAppend, "Unread ordinary draft granted write permission.");
+        });
+        yield return ("Third-version workflow DirectAppend frozen first frame does not bypass later upstream collection checks", async () =>
+        {
+            await using var f = new Fixture(root, protector);
+            f.Adapter.TitleSource = "ocr"; f.Adapter.DirectAppend = true; f.Adapter.OriginalTextRead = false;
+            f.Adapter.LiveStateAvailable = false;
+            var run = await f.StartAsync();
+            Equal(1, f.Adapter.Captures); Equal(1, f.Adapter.Scrolls); Equal(1, f.Adapter.UnchangedChecks);
+            Equal(0, f.Handler.Calls); Equal<ThirdVersionSession?>(null, run.Session);
+            Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId);
+        });
+        yield return ("Third-version workflow ForceGeneration strips identity metadata and remains copy-only even with fake identity fields", async () =>
+        {
+            foreach (var fakeIdentity in new[] { false, true })
+            {
+                await using var f = new Fixture(root, protector);
+                f.Adapter.ForceGeneration = true; f.Adapter.DirectAppend = true;
+                f.Adapter.DisplayNameRead = fakeIdentity; f.Adapter.OriginalTextRead = fakeIdentity;
+                f.Adapter.TitleSource = "ocr"; f.Adapter.RequiresConversationCheck = true;
+                f.Adapter.CaptureLocalTitle = "未经核对的群聊(8)"; f.Handler.ModelTitle = "错误的模型标题";
+                f.Repository.SaveContact(new Contact { DisplayName = "周老师", Confirmed = true, AddressTerm = "",
+                    IdentityLabel = "强制模式不得读取的本地身份" });
+                f.Repository.SaveTask(new TaskRecord { DisplayName = "周老师", Scene = "春节", GenerationStatus = "成功",
+                    Greeting = "强制模式不得读取的历史祝福", CompletedAt = DateTimeOffset.UtcNow });
+                var run = await f.StartAsync();
+                Equal(3, run.Session!.Candidates.Count); Equal(2, f.Handler.Calls); Equal("强制生成", run.Record.DisplayName);
+                Equal<Contact?>(null, run.Session.Contact); Equal(0, run.Session.Context.RecentGreetings.Count);
+                Equal<string?>(null, run.Record.ContactId); Equal(false, run.Record.ContactReused);
+                True(run.Session.Captures.All(x => x.ForceGeneration && !x.RequiresConversationCheck && x.LocalTitle is null),
+                    "Force generation retained unverified title or normal identity-check metadata.");
+                Equal<string?>(null, run.Record.ObservedDisplayName); Equal<bool?>(null, run.Record.ScreenshotRecipientMatched);
+                True(f.Handler.Bodies.All(x => !x.Contains("强制模式不得读取", StringComparison.Ordinal)), "Force generation uploaded saved identity/history.");
+                f.Workflow.Select(run, 0); True(!run.CanAppend, "Force generation granted write permission.");
+                await f.Workflow.AppendSelectedAsync(run, default);
+                Equal(0, f.Adapter.Appends); Equal<string?>(null, run.Record.AppendAttemptId); Equal(3, run.Session.Candidates.Count);
+                Equal("", f.Repository.Contacts("default").Single().AddressTerm);
             }
         });
         yield return ("Third-version workflow expiration and release revoke writes and release the retained original adapter", async () =>
@@ -276,7 +390,7 @@ internal static class ThirdVersionWorkflowChecks
             Repository = new LocalRepository(Path.Combine(folder, "repository"), protector);
             Handler = new WorkflowHandler(Adapter, unknownExtractions); Service = new ThirdVersionService(prompts, Handler);
             Workflow = new ThirdVersionWorkflow(Repository, protector, Service, Clock);
-            Settings = new AppSettings { DemoMode = false, Scene = "春节", Model = "offline-workflow-model", EnableLiveAppend = true,
+            Settings = new AppSettings { Scene = "春节", Model = "offline-workflow-model", EnableLiveAppend = true,
                 BaseUrl = "https://workflow.invalid/v1", AuthorizedOrigin = "https://workflow.invalid", ProtectedApiKey = protector.Protect("offline-not-a-real-key"),
                 RequestTimeoutSeconds = 5, TaskTimeoutSeconds = 30 };
         }
@@ -293,9 +407,12 @@ internal static class ThirdVersionWorkflowChecks
 
     private sealed class WorkflowAdapter : IConversationAdapter, IDisposable
     {
-        internal int Begins, Captures, Scrolls, Appends, Restores, Disposals;
-        internal bool CanCollectMore = true, ScrollSucceeds = true, DuplicateFrames, Ready = true, AllowAppend = true, OriginalTextRead = true, RequiresConversationCheck, ThrowDuringAppend;
+        internal int Begins, Captures, Scrolls, Appends, Restores, Disposals, UnchangedChecks;
+        internal bool CanCollectMore = true, ScrollSucceeds = true, DuplicateFrames, Ready = true, AllowAppend = true,
+            OriginalTextRead = true, DisplayNameRead = true, LiveStateAvailable = true, DirectAppend, ForceGeneration,
+            RequiresConversationCheck, ThrowDuringAppend;
         internal string Title = "周老师", TitleSource = "uia", CurrentDraft = " 原有草稿\r\n", CurrentIdentity = "original-window";
+        internal string? CaptureLocalTitle;
         internal ConversationSnapshot? Baseline, RestoredSnapshot;
         internal Action<ConversationSnapshot>? BeforeAppend;
         internal bool CancelOnScroll;
@@ -306,13 +423,16 @@ internal static class ThirdVersionWorkflowChecks
         public Task<ConversationSnapshot> BeginAsync(CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested(); Begins++;
-            Baseline = new("original-session", Title, CurrentDraft, CurrentIdentity, false, new object(), OriginalTextRead, true, TitleSource);
+            Baseline = new("original-session", Title, OriginalTextRead ? CurrentDraft : "", CurrentIdentity,
+                NativeState: new object(), OriginalTextRead: OriginalTextRead, DisplayNameRead: DisplayNameRead, TitleSource: TitleSource)
+                { DirectAppend = DirectAppend, ForceGeneration = ForceGeneration };
             return Task.FromResult(Baseline);
         }
         public Task<Capture> CaptureAsync(ConversationSnapshot snapshot, int index, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested(); True(ReferenceEquals(Baseline, snapshot), "Capture changed baseline."); Captures++;
-            return Task.FromResult(new Capture("capture_" + index, [1, 2, DuplicateFrames ? (byte)3 : (byte)(index + 3)], RequiresConversationCheck));
+            return Task.FromResult(new Capture("capture_" + index, [1, 2, DuplicateFrames ? (byte)3 : (byte)(index + 3)],
+                RequiresConversationCheck, CaptureLocalTitle));
         }
         public Task<bool> ScrollUpAsync(ConversationSnapshot snapshot, CancellationToken ct)
         {
@@ -321,14 +441,19 @@ internal static class ThirdVersionWorkflowChecks
             return Task.FromResult(ScrollSucceeds);
         }
         public Task<bool> IsUnchangedAsync(ConversationSnapshot snapshot, CancellationToken ct)
-        { ct.ThrowIfCancellationRequested(); return Task.FromResult(snapshot.OriginalText == CurrentDraft && snapshot.WindowIdentity == CurrentIdentity && snapshot.DisplayName == Title); }
+        {
+            ct.ThrowIfCancellationRequested(); UnchangedChecks++;
+            // Deferred visual append checks the current target; its unread initial draft is not a text baseline.
+            return Task.FromResult(LiveStateAvailable && (!snapshot.OriginalTextRead || snapshot.DirectAppend || snapshot.OriginalText == CurrentDraft) &&
+                snapshot.WindowIdentity == CurrentIdentity && snapshot.DisplayName == Title);
+        }
         public Task<bool> WaitForAppendReadyAsync(ConversationSnapshot snapshot, CancellationToken ct) { ct.ThrowIfCancellationRequested(); return Task.FromResult(Ready); }
         public Task<FillResult> AppendAsync(ConversationSnapshot snapshot, string greeting, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested(); Appends++; BeforeAppend?.Invoke(snapshot);
             if (ThrowDuringAppend) throw new IOException("模拟已发生但无法核实的写入。");
             CurrentDraft = DraftRules.Append(CurrentDraft, greeting);
-            return Task.FromResult(new FillResult("已预填", "", true));
+            return Task.FromResult(new FillResult("已预填", "", snapshot.OriginalTextRead ? true : null));
         }
         public Task RestoreAsync(ConversationSnapshot snapshot) { Restores++; RestoredSnapshot = snapshot; return Task.CompletedTask; }
         public void Dispose() => Disposals++;
@@ -337,12 +462,17 @@ internal static class ThirdVersionWorkflowChecks
     private sealed class WorkflowHandler(WorkflowAdapter adapter, int unknownExtractions) : HttpMessageHandler
     {
         internal int Calls, Extractions, Generations, Revisions;
+        internal List<string> Bodies { get; } = [];
+        internal Action? BeforeRequest;
         internal bool CancelExtraction, InvalidGeneration;
         internal string? ModelTitle;
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
             Equal("workflow.invalid", request.RequestUri!.Host); Equal("Bearer", request.Headers.Authorization?.Scheme);
+            BeforeRequest?.Invoke();
             var text = await request.Content!.ReadAsStringAsync(ct); using var document = JsonDocument.Parse(text);
+            Bodies.Add(JsonSerializer.Serialize(document.RootElement, new JsonSerializerOptions
+                { Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }));
             var messages = document.RootElement.GetProperty("messages"); Calls++;
             string content;
             if (messages[1].GetProperty("content").ValueKind == JsonValueKind.Array)
@@ -351,7 +481,7 @@ internal static class ThirdVersionWorkflowChecks
                 if (CancelExtraction) throw new OperationCanceledException("模拟请求取消。", ct);
                 var unknown = Extractions <= unknownExtractions;
                 content = JsonSerializer.Serialize(new { name = unknown ? null : "周老师", basis = unknown ? "unknown" : "direct",
-                    evidence = unknown ? null : "周老师，您好", observed_display_name = adapter.TitleSource == "ocr" ? null : ModelTitle ?? adapter.Title,
+                    evidence = unknown ? null : "周老师，您好", observed_display_name = adapter.TitleSource == "ocr" && !adapter.ForceGeneration ? null : ModelTitle ?? adapter.Title,
                     evidence_items = unknown ? Array.Empty<object>() : new object[] { new { source = "chat_message", speaker = "self", quote = "周老师，您好", capture_id = "capture_0" } } });
             }
             else if (messages[0].GetProperty("content").GetString()!.Contains("编辑，只负责", StringComparison.Ordinal))

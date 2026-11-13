@@ -9,18 +9,16 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
     public event Action<TaskProgress>? Progress;
 
     public async Task<TaskRecord?> RunAsync(AppSettings settings, IConversationAdapter adapter, IGreetingModel model,
-        Contact? confirmedContact, CancellationToken cancellationToken)
+        CancellationToken cancellationToken)
     {
         if (!await _gate.WaitAsync(0, cancellationToken)) return null;
         settings = settings with { ApiProfiles = settings.ApiProfiles.ToList() };
-        confirmedContact = confirmedContact is null ? null : confirmedContact with { };
         var taskExamples = examples.Snapshot();
-        var task = new TaskRecord { Scene = settings.Scene, AccountScope = settings.AccountScope,
-            IsDemo = settings.DemoMode, Model = settings.DemoMode ? "本地演示 · 无 API 调用" : settings.Model };
+        var task = new TaskRecord { Scene = settings.Scene, AccountScope = settings.AccountScope, Model = settings.Model };
         using var debug = DebugSession.Begin(settings.DebugMode, debugRoot ?? Path.Combine(AppContext.BaseDirectory, "debug"), "generation");
         task.DebugDirectory = debug.DirectoryPath;
         debug.WriteJson("task-start", new { task.Id, settings.Scene, settings.Model, settings.AutomationMode,
-            settings.DemoMode, settings.EnableLiveAppend, settings.TaskTimeoutSeconds });
+            settings.EnableLiveAppend, settings.TaskTimeoutSeconds });
         ConversationSnapshot? snapshot = null;
         using var budget = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         budget.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(settings.TaskTimeoutSeconds, 10, 180)));
@@ -29,120 +27,123 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
         {
             if (string.IsNullOrWhiteSpace(settings.Scene) || settings.Scene.Length > 100 || settings.ExtraInstruction.Length > 300)
                 throw new InvalidDataException("请选择祝福场景，并检查补充要求长度。");
-            if (!settings.DemoMode)
-            {
-                task.ProviderOrigin = DraftRules.Origin(settings);
-                if (settings.AuthorizedOrigin != task.ProviderOrigin)
-                    throw new InvalidDataException("请先在设置中授权向当前服务上传必要的聊天截图。");
-            }
-            Report("检查会话", "正在核对目标窗口与已有草稿", 8);
+            task.ProviderOrigin = DraftRules.Origin(settings);
+            if (settings.AuthorizedOrigin != task.ProviderOrigin)
+                throw new InvalidDataException("请确认向当前 API 上传必要聊天截图的授权。");
+            Report("检查会话", "正在核对目标聊天窗口", 8);
             snapshot = await adapter.BeginAsync(ct);
-            task.AutomationMethod = settings.DemoMode ? "demo" : adapter.AutomationMethod;
+            var forceGeneration = snapshot.ForceGeneration;
+            task.AutomationMethod = adapter.AutomationMethod;
             task.FallbackReason = adapter.FallbackReason;
             task.LayoutApiCallCount = adapter.LayoutApiCallCount;
-            task.DisplayName = snapshot.DisplayName;
+            task.DisplayName = forceGeneration ? "强制生成" : snapshot.DisplayName;
             task.OriginalTextRead = snapshot.OriginalTextRead;
-            if (!settings.DemoMode && snapshot.DisplayNameRead && DraftRules.LooksLikeGroupTitle(snapshot.DisplayName))
+            if (!forceGeneration && snapshot.DisplayNameRead && DraftRules.LooksLikeGroupTitle(snapshot.DisplayName))
             {
                 debug.Event("title-group-preflight", new { title = snapshot.DisplayName, group = true, modelCalls = 0 });
                 throw new GroupChatDetectedException();
             }
-            if (!snapshot.DisplayNameRead && (adapter.CanAutoAppend || snapshot.OriginalTextRead))
+            if (!forceGeneration && !snapshot.DisplayNameRead && (adapter.CanAutoAppend || snapshot.OriginalTextRead))
                 throw new InvalidDataException("本次没有独立读取聊天标题，只能使用未读取草稿的只读快照。");
-            if (!snapshot.OriginalTextRead && adapter.CanAutoAppend)
+            if (!snapshot.OriginalTextRead && !snapshot.DirectAppend && adapter.CanAutoAppend)
                 throw new InvalidDataException("本次未读取完整草稿，不能自动追加。");
             task.OriginalCharacters = snapshot.OriginalTextRead ? DraftRules.VisibleLength(snapshot.OriginalText) : 0;
-            debug.WriteJson("conversation-check", new { snapshot.DisplayName, snapshot.WindowIdentity, snapshot.IsDemo,
-                snapshot.OriginalTextRead, snapshot.DisplayNameRead, snapshot.TitleSource, task.OriginalCharacters, task.AutomationMethod, task.FallbackReason });
+            debug.WriteJson("conversation-check", new { snapshot.DisplayName, snapshot.WindowIdentity,
+                snapshot.OriginalTextRead, snapshot.DirectAppend, snapshot.DisplayNameRead, snapshot.TitleSource, forceGeneration, task.OriginalCharacters,
+                task.AutomationMethod, task.FallbackReason });
             // Product policy uses the visible chat name as a scoped lookup key, not a WeChat identity.
-            var matchedContact = !snapshot.DisplayNameRead ? null : snapshot.IsDemo ? confirmedContact :
+            var matchedContact = forceGeneration || !snapshot.DisplayNameRead ? null :
                 repository.FindContactByName(settings.AccountScope, snapshot.DisplayName);
             var contact = DraftRules.ContactForGeneration(matchedContact);
             task.ContactId = contact?.Id;
-            task.ContactReused = !snapshot.IsDemo && contact is not null;
+            task.ContactReused = contact is not null;
             repository.SaveTask(task);
             var selected = taskExamples.Select(settings.Scene, contact?.Relationship ?? "unknown");
             task.ExamplesVersion = taskExamples.Version;
             task.ExampleIds = selected.Select(x => x.Id).ToArray();
-            var previousGreetings = !settings.DemoMode && snapshot.DisplayNameRead
-                ? await Task.Run(() => repository.RecentGreetings(settings.AccountScope, matchedContact?.Id,
-                    snapshot.DisplayName, settings.Scene, false, ct), ct) : [];
-            var generationContext = new GreetingGenerationContext(previousGreetings);
-            var captures = new List<Capture>(); ModelResponse? answer = null; bool extraUsed = false;
-            for (var round = 0; round <= 3; round++)
+            const int maxCaptures = DraftRules.MaxContextCaptures;
+            var captures = new List<Capture>(maxCaptures);
+            for (var round = 0; round < maxCaptures; round++)
             {
                 ct.ThrowIfCancellationRequested();
-                if (!await adapter.IsUnchangedAsync(snapshot, ct))
+                // The visual adapter validates the first capture itself, or uses the already validated frozen frame.
+                if ((round != 0 || !snapshot.DirectAppend) && !await adapter.IsUnchangedAsync(snapshot, ct))
                     throw new InvalidDataException(adapter.StateChangeReason.Length > 0 ? adapter.StateChangeReason : "会话或输入状态已变化，请重新触发。");
-                Report("采集上下文", (round == 0 ? "仅采集当前聊天的必要区域" : $"补充上下文 {round}/3") +
-                    (snapshot.OriginalTextRead ? $" · 保留原有 {task.OriginalCharacters} 个字符" : " · 只采集截图，未读取草稿"), 15 + round * 12);
+                var captureDetail = round == 0 ? "采集当前消息区" : $"采集上滚后的消息区 {round + 1}/{maxCaptures}";
+                Report("采集上下文", captureDetail +
+                    (snapshot.OriginalTextRead ? $" · 保留原有 {task.OriginalCharacters} 个字符" : " · 生成前未读取草稿"), 15 + round * 6);
                 var capture = await adapter.CaptureAsync(snapshot, round, ct);
-                if (!snapshot.DisplayNameRead) capture = capture with { RequiresConversationCheck = true };
-                if (settings.DemoMode) debug.WriteJson("demo-context", new { round, capture.Id, synthetic = true });
-                else debug.WriteBytes("context-" + round, capture.PngBytes, ".png");
-                if (captures.Count > 0 && capture.PngBytes.AsSpan().SequenceEqual(captures[^1].PngBytes)) break;
-                captures.Add(capture); task.CaptureCount = captures.Count;
-                while (true)
+                if (forceGeneration)
+                    capture = capture with { ForceGeneration = true, RequiresConversationCheck = false, LocalTitle = null };
+                else
                 {
-                    ct.ThrowIfCancellationRequested();
-                    Report("生成祝福", settings.DemoMode ? "本地演示生成中" : $"正在请求 {settings.Model} · 第 {task.ApiCallCount + 1} 次", 35 + round * 10);
-                    if (!settings.DemoMode) task.ApiCallCount++;
-                    task.GenerationStatus = "进行中"; repository.SaveTask(task);
-                    try
-                    {
-                        answer = await model.GenerateAsync(settings, settings.DemoMode ? "" : protector.Unprotect(settings.ProtectedApiKey),
-                            captures, contact, selected, round == 3 || !adapter.CanCollectMoreContext, generationContext, ct);
-                        DraftRules.ValidateGreeting(answer);
-                        DraftRules.ValidateConversation(answer, captures);
-                        DraftRules.ValidateSalutation(answer, contact, captures, snapshot.TitleSource == "ocr" ? snapshot.DisplayName : null);
-                        if (!settings.DemoMode)
-                        {
-                            var address = DraftRules.ResolveAddressTerm(contact, answer);
-                            var quotations = new[] { contact?.AddressEvidence?.Quote, answer.AddressEvidence?.Quote }
-                                .Where(q => q is not null && DraftRules.VisibleLength(q) >= 20).Select(q => q!);
-                            if (previousGreetings.Concat(quotations).Any(text => GreetingDiversity.TooSimilar(answer.GreetingText, text, address)))
-                                throw new RepeatedGreetingException();
-                        }
-                        break;
-                    }
-                    catch (Exception e) when (!extraUsed && (e is TransientApiException or JsonException or InvalidDataException or RepeatedGreetingException))
-                    {
-                        // Network, format and repetition corrections share one extra request; configuration errors do not retry.
-                        if (e is InvalidDataException && e.Message.StartsWith("API ", StringComparison.Ordinal)) throw;
-                        extraUsed = true;
-                        if (e is RepeatedGreetingException)
-                            generationContext = generationContext with { RejectedCandidate = answer!.GreetingText };
-                        var delay = e is TransientApiException transient ? transient.RetryAfter : TimeSpan.FromMilliseconds(300);
-                        if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
-                        debug.Event("model-retry", new { type = e.GetType().Name, e.Message, delayMs = delay.TotalMilliseconds });
-                        Report(e is RepeatedGreetingException ? "改写祝福" : "重试请求",
-                            e is RepeatedGreetingException ? "内容与已有祝福太相似，正在换一种表达" : "本任务最多额外请求一次", 40);
-                        await Task.Delay(delay, ct);
-                    }
+                    if (capture.LocalTitle is not null && (!snapshot.DisplayNameRead || capture.LocalTitle != snapshot.DisplayName) ||
+                        captures.Count > 0 && capture.LocalTitle != captures[0].LocalTitle)
+                        throw new InvalidDataException("本地聊天标题与本次会话不一致，未上传截图。");
+                    if (!snapshot.DisplayNameRead) capture = capture with { RequiresConversationCheck = true };
                 }
-                if (!answer.NeedsMoreContext || answer.ContextSufficient || round == 3 || !adapter.CanCollectMoreContext) break;
-                if (!await adapter.ScrollUpAsync(snapshot, ct)) break;
+                if (captures.Any(previous => capture.PngBytes.AsSpan().SequenceEqual(previous.PngBytes))) break;
+                if (captures.Sum(previous => (long)previous.PngBytes.Length) + capture.PngBytes.Length > 12 * 1024 * 1024)
+                {
+                    if (captures.Count == 0) throw new InvalidDataException("消息截图超过 12 MiB。");
+                    break;
+                }
+                debug.WriteBytes("context-" + round, capture.PngBytes, ".png");
+                captures.Add(capture);
+                task.CaptureCount = captures.Count;
+                if (round + 1 == maxCaptures || !adapter.CanCollectMoreContext || !await adapter.ScrollUpAsync(snapshot, ct)) break;
                 task.ScrollCount++;
+            }
+
+            ModelResponse? answer;
+            var extraUsed = false;
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                Report("生成祝福", $"正在请求 {settings.Model} · {captures.Count} 张截图", 35);
+                task.ApiCallCount++;
+                task.GenerationStatus = "进行中"; repository.SaveTask(task);
+                try
+                {
+                    answer = await model.GenerateAsync(settings, protector.Unprotect(settings.ProtectedApiKey),
+                        captures, contact, selected, finalRound: true, ct);
+                    DraftRules.ValidateGreeting(answer);
+                    DraftRules.ValidateConversation(answer, captures);
+                    DraftRules.ValidateSalutation(answer, contact, captures, snapshot.TitleSource == "ocr" ? snapshot.DisplayName : null);
+                    break;
+                }
+                catch (Exception e) when (!extraUsed && (e is TransientApiException or JsonException or InvalidDataException))
+                {
+                    if (e is InvalidDataException && e.Message.StartsWith("API ", StringComparison.Ordinal)) throw;
+                    extraUsed = true;
+                    var delay = e is TransientApiException transient ? transient.RetryAfter : TimeSpan.FromMilliseconds(300);
+                    if (delay < TimeSpan.Zero) delay = TimeSpan.Zero;
+                    debug.Event("model-retry", new { type = e.GetType().Name, e.Message, delayMs = delay.TotalMilliseconds });
+                    Report("重试请求", "本任务最多额外请求一次", 40);
+                    await Task.Delay(delay, ct);
+                }
             }
             if (answer is null) throw new InvalidDataException("没有获得可用的祝福正文。");
             task.Greeting = answer.GreetingText; task.GeneratedAt = DateTimeOffset.UtcNow; task.GenerationStatus = "成功";
             debug.WriteJson("greeting-parsed", answer);
-            task.ObservedDisplayName = snapshot.TitleSource == "ocr" ? snapshot.DisplayName : answer.ObservedDisplayName;
-            if (snapshot.TitleSource != "ocr" && !settings.DemoMode && string.IsNullOrWhiteSpace(answer.ObservedDisplayName))
+            var titleCheckedLocally = captures[0].LocalTitle is not null;
+            task.ObservedDisplayName = forceGeneration ? null : titleCheckedLocally ? snapshot.DisplayName : answer.ObservedDisplayName;
+            if (!forceGeneration && !titleCheckedLocally && string.IsNullOrWhiteSpace(answer.ObservedDisplayName))
                 throw new InvalidDataException("模型没有识别出截图中的聊天标题，已保留生成内容并停止预填。");
-            if (!snapshot.DisplayNameRead && (answer.ObservedDisplayName is not { Length: > 0 and <= 80 } || answer.ObservedDisplayName.Any(char.IsControl)))
+            if (!forceGeneration && !snapshot.DisplayNameRead &&
+                (answer.ObservedDisplayName is not { Length: > 0 and <= 80 } || answer.ObservedDisplayName.Any(char.IsControl)))
                 throw new InvalidDataException("截图中的聊天标题未能明确识别。生成内容已保留，请人工核对。");
-            if (snapshot.TitleSource != "ocr" && snapshot.DisplayNameRead && !string.IsNullOrWhiteSpace(answer.ObservedDisplayName))
+            if (!forceGeneration && !titleCheckedLocally && snapshot.DisplayNameRead && !string.IsNullOrWhiteSpace(answer.ObservedDisplayName))
             {
                 task.ScreenshotRecipientMatched = answer.ObservedDisplayName.Trim() == snapshot.DisplayName.Trim();
                 if (task.ScreenshotRecipientMatched == false)
                     throw new InvalidDataException("模型识别的聊天标题与当前会话不一致，已保留生成内容并停止预填。");
             }
-            if (!snapshot.DisplayNameRead)
+            if (forceGeneration || !snapshot.DisplayNameRead)
             {
                 // A model-read title describes the frozen frame; it is not an independent identity.
                 // Do not use it to read or mutate a saved contact or authorize a write.
-                task.DisplayName = answer.ObservedDisplayName!.Trim();
+                if (!forceGeneration) task.DisplayName = answer.ObservedDisplayName!.Trim();
                 task.ScreenshotRecipientMatched = null;
                 task.Relationship = answer.RelationshipType;
                 task.IdentityLabel = answer.IdentityLabel;
@@ -154,8 +155,7 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
             {
                 var resolvedContact = matchedContact is null
                     ? new Contact { AccountScope = settings.AccountScope, DisplayName = snapshot.DisplayName.Trim(),
-                        RemarkName = snapshot.IsDemo ? null : snapshot.DisplayName.Trim(),
-                        BindingStatus = snapshot.IsDemo ? "candidate" : "name_match", IsDemo = snapshot.IsDemo }
+                        RemarkName = snapshot.DisplayName.Trim(), BindingStatus = "name_match" }
                     : matchedContact with { };
                 if (!resolvedContact.Confirmed)
                 {
@@ -169,11 +169,8 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
                         resolvedContact.AddressEvidence = answer.AddressEvidence;
                     }
                 }
-                if (!snapshot.IsDemo)
-                {
-                    if (string.IsNullOrWhiteSpace(resolvedContact.RemarkName)) resolvedContact.RemarkName = snapshot.DisplayName.Trim();
-                    resolvedContact.BindingStatus = "name_match";
-                }
+                if (string.IsNullOrWhiteSpace(resolvedContact.RemarkName)) resolvedContact.RemarkName = snapshot.DisplayName.Trim();
+                resolvedContact.BindingStatus = "name_match";
                 repository.SaveContact(resolvedContact);
                 task.ContactId = resolvedContact.Id;
                 task.Relationship = resolvedContact.Relationship;
@@ -184,17 +181,18 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
             }
             repository.SaveTask(task);
             ct.ThrowIfCancellationRequested();
-            Report("核对输入", "检查会话、焦点和原文是否仍一致", 86);
-            if (!settings.DemoMode && !settings.EnableLiveAppend)
+            Report("核对输入", forceGeneration ? "核对微信窗口和输入框位置"
+                : snapshot.DirectAppend ? "核对目标会话和输入框位置" : "检查会话、焦点和原文是否仍一致", 86);
+            if (!forceGeneration && !settings.EnableLiveAppend)
             {
                 task.FillStatus = "待手动处理"; task.Error = "预填已关闭。生成内容已保留，可复制正文。";
             }
-            else if (!snapshot.DisplayNameRead || !adapter.CanAutoAppend)
+            else if ((!forceGeneration && !snapshot.DisplayNameRead) || !adapter.CanAutoAppend)
             {
                 task.FillStatus = "待手动处理";
                 task.Error = adapter.AutoAppendUnavailableReason.Length > 0 ? adapter.AutoAppendUnavailableReason : "自动追加未启用。请检查生成内容后复制。";
             }
-            else if (!snapshot.OriginalTextRead)
+            else if (!snapshot.OriginalTextRead && !snapshot.DirectAppend)
             {
                 task.FillStatus = "待手动处理"; task.Error = "本次未读取完整草稿，不能自动追加。请检查生成内容后复制。";
             }
@@ -238,7 +236,7 @@ public sealed class TaskCoordinator(LocalRepository repository, ExampleService e
             if (snapshot is not null) { try { await adapter.RestoreAsync(snapshot); } catch { /* Never undo user activity. */ } }
             else if (adapter is IDisposable disposable) { try { disposable.Dispose(); } catch { /* Release a partially initialized adapter. */ } }
             if (adapter.CleanupWarning.Length > 0) task.Error = (task.Error.Length > 0 ? task.Error + " " : "") + adapter.CleanupWarning;
-            task.AutomationMethod = settings.DemoMode ? "demo" : adapter.AutomationMethod;
+            task.AutomationMethod = adapter.AutomationMethod;
             task.FallbackReason = adapter.FallbackReason;
             task.LayoutApiCallCount = adapter.LayoutApiCallCount;
             task.CompletedAt = DateTimeOffset.UtcNow;

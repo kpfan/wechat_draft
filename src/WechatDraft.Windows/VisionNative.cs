@@ -1,6 +1,8 @@
 using System;
 using System.Diagnostics;
+using System.Linq;
 using System.Runtime.InteropServices;
+using System.Text;
 using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
@@ -22,6 +24,38 @@ internal static partial class Native
     [DllImport("user32.dll")] internal static extern bool ClientToScreen(nint hwnd, ref Point point);
     [DllImport("user32.dll")] internal static extern bool IsClipboardFormatAvailable(uint format);
     [DllImport("user32.dll")] internal static extern int GetSystemMetrics(int index);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(nint hwnd, StringBuilder text, int capacity);
+
+    internal static object DescribeWindow(nint hwnd)
+    {
+        GetWindowThreadProcessId(hwnd, out var pid);
+        var name = "";
+        try { using var process = Process.GetProcessById((int)pid); name = process.ProcessName; } catch { }
+        var className = new StringBuilder(256);
+        GetClassName(hwnd, className, className.Capacity);
+        return new { handle = hwnd.ToInt64(), processId = pid, processName = name, className = className.ToString(),
+            owner = GetAncestor(hwnd, 3).ToInt64() };
+    }
+
+    internal static INPUT[] PrepareUnicodeInput(string text)
+    {
+        if (text.Length is 0 or > 4096 || text.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029'))
+            throw new InvalidOperationException("祝福正文无法直接输入，已保留正文供手动处理。");
+
+        // VK_PACKET carries text. In particular, this batch contains no Enter, paste, or copy key.
+        var inputs = new INPUT[text.Length * 2];
+        for (var i = 0; i < text.Length; i++)
+        {
+            var input = new INPUT { Type = 1, Data = new InputUnion
+            {
+                Keyboard = new KeyboardInput { Scan = text[i], Flags = 0x4, ExtraInfo = VisionInputTag }
+            } };
+            inputs[2 * i] = input;
+            input.Data.Keyboard.Flags |= 0x2;
+            inputs[2 * i + 1] = input;
+        }
+        return inputs;
+    }
 
     internal static void VisionChord(ushort key)
     {
@@ -56,8 +90,27 @@ internal static partial class Native
             SendInput(1, new[] { release }, Marshal.SizeOf<INPUT>());
         }
     }
-    internal static void VisionWheel(int delta) => Keys(new INPUT
-    { Type = 0, Data = new InputUnion { Mouse = new MouseInput { Flags = 0x800, MouseData = unchecked((uint)delta), ExtraInfo = VisionInputTag } } });
+    internal static void VisionPage(ushort key, int presses)
+    {
+        if (key is not (0x21 or 0x22)) throw new InvalidOperationException("不允许的翻页按键。");
+        var down = Key(key);
+        var up = Key(key, true);
+        down.Data.Keyboard.Flags |= 1; // Extended navigation key, not the numeric keypad.
+        up.Data.Keyboard.Flags |= 1;
+        down.Data.Keyboard.ExtraInfo = up.Data.Keyboard.ExtraInfo = VisionInputTag;
+        var keys = new INPUT[presses * 2];
+        for (var i = 0; i < keys.Length; i += 2)
+        {
+            keys[i] = down;
+            keys[i + 1] = up;
+        }
+        try { Keys(keys); }
+        catch
+        {
+            SendInput(1, new[] { up }, Marshal.SizeOf<INPUT>());
+            throw;
+        }
+    }
 }
 
 internal sealed class VisionInputMonitor : IDisposable
@@ -76,9 +129,10 @@ internal sealed class VisionInputMonitor : IDisposable
     public string? LastActivity => _state.LastActivity;
     public string LastActivityDescription => _state.LastActivityDescription;
 
-    public VisionInputMonitor(nint target, bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true, nint companion = 0)
+    public VisionInputMonitor(nint target, bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true,
+        nint companion = 0, bool trackWheelActivity = true)
     {
-        _state = new VisionInteractionState(stopOnWheel, stopOnClick, stopOnKeyboard);
+        _state = new VisionInteractionState(stopOnWheel, stopOnClick, stopOnKeyboard, trackWheelActivity: trackWheelActivity);
         _keyboard = (code, message, data) =>
         {
             if (code >= 0 && message is 0x100 or 0x104)
@@ -97,7 +151,7 @@ internal sealed class VisionInputMonitor : IDisposable
             var actual = Native.GetForegroundWindow(); var changed = _state.Changed;
             _state.Foreground(hwnd, actual, target, companion);
             if (!changed && _state.Changed && _state.Reason == "foreground-change" && debug is { Enabled: true })
-                debug.Event("visual-foreground-change", new { reported = DescribeWindow(hwnd), actual = DescribeWindow(actual),
+                debug.Event("visual-foreground-change", new { reported = Native.DescribeWindow(hwnd), actual = Native.DescribeWindow(actual),
                     target = target.ToInt64(), companion = companion.ToInt64() });
         };
         var module = Native.GetModuleHandle(null);
@@ -106,12 +160,6 @@ internal sealed class VisionInputMonitor : IDisposable
         _foregroundHook = Native.SetWinEventHook(3, 3, 0, _foreground, 0, 0, 0);
         if (_keyboardHook == 0 || _mouseHook == 0 || _foregroundHook == 0)
         { Dispose(); throw new InvalidOperationException("无法监测用户操作，已停止预填。"); }
-    }
-    private static object DescribeWindow(nint hwnd)
-    {
-        Native.GetWindowThreadProcessId(hwnd, out var pid); var name = "";
-        try { using var process = Process.GetProcessById((int)pid); name = process.ProcessName; } catch { }
-        return new { handle = hwnd.ToInt64(), processId = pid, processName = name, owner = Native.GetAncestor(hwnd, 3).ToInt64() };
     }
     public void Dispose()
     {

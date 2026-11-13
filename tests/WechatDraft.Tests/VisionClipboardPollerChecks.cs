@@ -81,12 +81,5 @@ internal static class VisionClipboardPollerChecks
             }
             catch (InvalidOperationException e) when (e.Message == "non-text or busy") { }
         });
-        yield return ("An unchanged clipboard cannot authorize a write over a previously read nonempty draft", async () =>
-        {
-            var initial = await VisionClipboardPoller.ReadAsync(() => (true, "原有草稿"), () => { }, default);
-            var guard = new WechatDraft.Core.OcrPrefillGuard("测试好友", initial.Text);
-            var beforeWrite = await VisionClipboardPoller.ReadAsync(() => (false, (string?)null), () => { }, default);
-            if (guard.CheckDraft(beforeWrite.Text) || guard.TryIssuePaste()) throw new Exception("A failed later copy bypassed original-draft preservation.");
-        });
     }
 }

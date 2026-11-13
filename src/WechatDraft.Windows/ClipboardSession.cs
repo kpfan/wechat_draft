@@ -5,6 +5,7 @@ namespace WechatDraft.Windows;
 
 internal interface IClipboardWrite : IDisposable { void Commit(); }
 internal sealed class ClipboardBusyException(string message) : InvalidOperationException(message);
+internal sealed class ClipboardBackupUnavailableException(string message, Exception? inner = null) : InvalidOperationException(message, inner);
 internal interface IClipboardSnapshot : IDisposable { IClipboardWrite PrepareRestore(); }
 internal interface IClipboardBackend : IDisposable
 {
@@ -12,6 +13,7 @@ internal interface IClipboardBackend : IDisposable
     void Close();
     uint Sequence { get; }
     uint OwnerProcess { get; }
+    void PrepareCapture() { }
     IClipboardSnapshot Capture();
     IClipboardWrite PrepareText(string text);
     void Empty();
@@ -35,6 +37,7 @@ internal sealed class ClipboardSession : IDisposable
         if (!Gate.Wait(0)) { backend.Dispose(); throw new InvalidOperationException("其他任务正在使用剪贴板，请稍后重试。"); }
         try
         {
+            backend.PrepareCapture();
             Open();
             try { _snapshot = backend.Capture(); _sequence = backend.Sequence; }
             finally { backend.Close(); }

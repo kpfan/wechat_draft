@@ -8,6 +8,8 @@ public sealed class GroupChatDetectedException() : InvalidOperationException("�
 
 public static partial class DraftRules
 {
+    internal const int MaxContextCaptures = 3;
+
     public static bool LooksLikeGroupTitle(string? title)
     {
         if (string.IsNullOrWhiteSpace(title)) return false;
@@ -37,10 +39,7 @@ public static partial class DraftRules
 
     public static readonly string[] Relationships = ["family", "friend", "colleague", "manager", "teacher", "customer", "other", "unknown"];
 
-    public static string AppendSuffix(string existing, string greeting) =>
-        existing.Length == 0 || existing.EndsWith('\n') || existing.EndsWith('\r') ? greeting : "\r\n" + greeting;
-
-    public static string Append(string existing, string greeting) => existing + AppendSuffix(existing, greeting);
+    public static string Append(string existing, string greeting) => existing + greeting;
     public static string NormalizeNewlines(string text) => text.Replace("\r\n", "\n").Replace('\r', '\n');
     public static int VisibleLength(string text) => StringInfo.ParseCombiningCharacters(text).Length;
 
@@ -50,29 +49,11 @@ public static partial class DraftRules
         if (!Relationships.Contains(response.RelationshipType)) throw new InvalidDataException("模型返回了未知关系类型。");
         var text = response.GreetingText;
         if (string.IsNullOrWhiteSpace(text)) throw new InvalidDataException("模型未返回祝福正文。");
-        if (VisibleLength(text) > 120) throw new InvalidDataException("祝福超过 120 个可见字符，请缩短后重试。");
         if (text != text.Trim() || text.Contains('\n') || text.Contains('\r')) throw new InvalidDataException("祝福应为一段完整正文。");
         if (text.Any(char.IsControl) || text.Contains("```") || Placeholder().IsMatch(text))
             throw new InvalidDataException("祝福包含控制字符、格式标记或未替换变量。");
         if (response.AddressTerm?.Length > 30 || response.IdentityLabel?.Length > 80)
             throw new InvalidDataException("模型识别字段过长。");
-    }
-
-    public static void ValidateSceneGreeting(string greeting, string scene)
-    {
-        string[]? markers = scene.Trim() switch
-        {
-            "春节" => ["春节", "新春", "新年", "过年"],
-            "元旦" => ["元旦", "新年"],
-            "生日" => ["生日", "生辰", "新的一岁"],
-            "中秋" => ["中秋", "月圆", "团圆"],
-            "端午" => ["端午"], "国庆" => ["国庆"],
-            "七夕" => ["七夕"], "圣诞" => ["圣诞"],
-            "纪念日" => ["纪念", "周年"],
-            _ => null
-        };
-        if (markers is not null && !markers.Any(greeting.Contains))
-            throw new InvalidDataException("祝福没有体现所选场景，未写入微信。");
     }
 
     public static string? ResolveAddressTerm(Contact? contact, ModelResponse? response = null)

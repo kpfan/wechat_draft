@@ -43,6 +43,16 @@ try
         Console.WriteLine(JsonSerializer.Serialize(new { formats = ClipboardDiagnostics.Formats() }));
         return 0;
     }
+    if (mode == "export-model-config")
+    {
+        if (args.Length != 4 || !File.Exists(Path.Combine(data, "drafts.db")))
+            throw new InvalidDataException("用法：export-model-config <源数据目录> <软件发布目录> <model-config.wdc 输出路径>");
+        var sourceProtector = new DpapiProtector();
+        var sourceSettings = new LocalRepository(data, sourceProtector).LoadSettings();
+        ModelConfigPackage.ExportDefault(sourceSettings, Path.GetFullPath(args[2]), Path.GetFullPath(args[3]), sourceProtector);
+        Console.WriteLine("已生成加密模型配置。分发与本次导出配套的软件包和 model-config.wdc。");
+        return 0;
+    }
     if (mode == "probe-interactive" &&
         (Path.TrimEndingDirectorySeparator(data).Equals(Path.TrimEndingDirectorySeparator(Path.GetFullPath("artifacts/app/data")), StringComparison.OrdinalIgnoreCase) ||
          File.Exists(Path.Combine(data, "drafts.db"))))
@@ -87,7 +97,7 @@ try
         var candidate = settings with {
             BaseUrl = source.BaseUrl, ApiPath = source.ApiPath, Model = source.Model,
             ProtectedApiKey = protector.Protect(key), RequestTimeoutSeconds = 60,
-            TaskTimeoutSeconds = Math.Max(settings.TaskTimeoutSeconds, 150), DemoMode = false
+            TaskTimeoutSeconds = Math.Max(settings.TaskTimeoutSeconds, 150)
         };
         var origin = DraftRules.Origin(candidate);
         var authorizeScreens = args.Contains("--authorize-screens", StringComparer.Ordinal);
@@ -116,7 +126,7 @@ try
     {
         var origin = DraftRules.Origin(settings);
         Console.WriteLine(JsonSerializer.Serialize(new {
-            origin, settings.Model, settings.AutomationMode, settings.DemoMode, settings.EnableLiveAppend, settings.WindowLayout,
+            origin, settings.Model, settings.AutomationMode, settings.EnableLiveAppend, settings.WindowLayout,
             chatScreenshotAuthorized = settings.AuthorizedOrigin == origin,
             fullWindowAuthorized = settings.VisionAuthorizedOrigin == origin,
             hasStoredChatConsent = settings.AuthorizedOrigin.Length > 0,
@@ -148,7 +158,7 @@ try
         {
             settings = new AppSettings {
                 BaseUrl = "https://ark.cn-beijing.volces.com/api/plan/v3", Model = "doubao-seed-2.1-lite",
-                ProtectedApiKey = protector.Protect(key), DemoMode = false, EnableLiveAppend = false,
+                ProtectedApiKey = protector.Protect(key), EnableLiveAppend = false,
                 RequestTimeoutSeconds = 60, TaskTimeoutSeconds = 150, Scene = "生日"
             };
             repository.SaveSettings(settings);
@@ -176,7 +186,6 @@ try
         settings.Model = "glm-4.6v-flash";
         settings.ProtectedApiKey = protector.Protect(key);
         settings.AuthorizedOrigin = DraftRules.Origin(settings);
-        settings.DemoMode = false;
         settings.EnableLiveAppend = true;
         settings.RequestTimeoutSeconds = 60;
         settings.TaskTimeoutSeconds = 150;

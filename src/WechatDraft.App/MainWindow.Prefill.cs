@@ -17,12 +17,12 @@ public sealed partial class MainWindow
     }
 
     private string PrefillHint() => _settings.EnableLiveAppend
-        ? "生成三个候选后，选择要使用的一条，再点“预填当前选中正文”。沿用开始时的聊天及完整草稿检查，最多保留 10 分钟；聊天、草稿或窗口变化后停止预填，不会自动发送。"
-        : "只生成三个候选，可选择、修改和复制。开启预填仅对重新开始的任务生效。";
+        ? "选中候选后点击预填，再回到原微信聊天，最多等待 30 秒。视觉模式追加到填写时的当前草稿末尾，UIA 模式要求原稿保持一致。强制生成仅供复制；发送始终手动确认。"
+        : "只生成祝福，结果显示在助手中。开启后仅对新任务生效。";
 
     private void SavePrefillPreference()
     {
-        if (_updatingPrefill || _prefill is null || _coordinator.IsRunning || _runCancellation is not null) return;
+        if (_updatingPrefill || _prefill is null || IsTaskBusy) return;
         var previous = _settings.EnableLiveAppend;
         try
         {
@@ -38,6 +38,6 @@ public sealed partial class MainWindow
             Notify("预填选项未能保存：" + e.Message, InfoBarSeverity.Warning);
         }
         if (_prefillHelp is not null) _prefillHelp.Text = PrefillHint();
-        if (_startButton is not null) _startButton.Content = _settings.DemoMode ? "✦  生成并预填草稿" : "✦  生成三个祝福候选";
+        if (_startButton is not null) _startButton.Content = "✦  生成三个祝福候选";
     }
 }

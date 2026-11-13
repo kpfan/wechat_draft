@@ -8,9 +8,12 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.Threading.Tasks;
 using WechatDraft.Core;
 
 namespace WechatDraft.Windows;
+
+internal enum WechatToolbarTheme { Light, Dark }
 
 // v0 reference: match only the selected window crop. Results stay window-relative until an action.
 internal static class WechatTemplateLocator
@@ -24,7 +27,11 @@ internal static class WechatTemplateLocator
     private readonly record struct Sample(int Offset, double Centered);
     private sealed record TemplateSamples(int Width, int Height, Sample[] Samples, double Energy);
 
-    internal static VisionAnchorHints? Locate(Bitmap screenshot, uint dpi, CancellationToken ct)
+    internal static VisionAnchorHints? Locate(Bitmap screenshot, uint dpi, CancellationToken ct) =>
+        Locate(screenshot, dpi, ct, WechatToolbarTheme.Dark, _ => true)?.Anchors;
+
+    internal static (VisionAnchorHints Anchors, WechatToolbarTheme Theme)? Locate(
+        Bitmap screenshot, uint dpi, CancellationToken ct, WechatToolbarTheme preferred, Func<VisionAnchorHints, bool> accept)
     {
         ct.ThrowIfCancellationRequested();
         if (dpi is < 96 or > 384 || screenshot.Width < 400 || screenshot.Height < 350 ||
@@ -32,31 +39,45 @@ internal static class WechatTemplateLocator
         var budget = new SearchBudget(ct);
         try
         {
-            var scale = dpi / 192d;
-            using var top = LoadTemplate("wechat_top_template.png", scale);
-            using var bottom = LoadTemplate("wechat_bottom_template.png", scale);
-            if (top is null || bottom is null) return null;
-            if (top.Width >= screenshot.Width || bottom.Width >= screenshot.Width ||
-                top.Height >= screenshot.Height || bottom.Height >= screenshot.Height) return null;
             var frame = ToGray(screenshot, budget);
             var coarseFrame = Half(frame, budget);
-            var topMatch = Find(frame, coarseFrame, ToGray(top, budget),
-                Rectangle.FromLTRB(screenshot.Width * 35 / 100, 0, screenshot.Width, screenshot.Height * 32 / 100), budget);
-            if (topMatch is null) return null;
-            var bottomMatch = Find(frame, coarseFrame, ToGray(bottom, budget),
-                Rectangle.FromLTRB(screenshot.Width * 15 / 100, screenshot.Height * 35 / 100,
-                    screenshot.Width, screenshot.Height), budget);
-            if (bottomMatch is null || topMatch.Bounds.Bottom + topMatch.Bounds.Height >= bottomMatch.Bounds.Top ||
-                topMatch.Bounds.Right <= bottomMatch.Bounds.Left ||
-                topMatch.Bounds.Left + topMatch.Bounds.Width / 2 <= bottomMatch.Bounds.Left) return null;
-            budget.Check();
+            var topRegion = Rectangle.FromLTRB(frame.Width * 35 / 100, 0, frame.Width, frame.Height * 32 / 100);
+            var bottomRegion = Rectangle.FromLTRB(0, frame.Height * 35 / 100, frame.Width, frame.Height);
             VisionBox Normalize(Rectangle rectangle) => new()
             {
                 X = rectangle.X * 1000d / frame.Width, Y = rectangle.Y * 1000d / frame.Height,
                 Width = rectangle.Width * 1000d / frame.Width, Height = rectangle.Height * 1000d / frame.Height
             };
-            return new() { TopToolbar = Normalize(topMatch.Bounds), BottomToolbar = Normalize(bottomMatch.Bounds),
-                TopScore = topMatch.Score, BottomScore = bottomMatch.Score, Scale = scale };
+            var alternate = preferred == WechatToolbarTheme.Dark ? WechatToolbarTheme.Light : WechatToolbarTheme.Dark;
+            var templateScale = dpi / 192d;
+            foreach (var theme in new[] { preferred, alternate })
+            {
+                budget.Check();
+                var suffix = theme == WechatToolbarTheme.Light ? "_light" : "";
+                using var top = LoadTemplate($"wechat_top_template{suffix}.png", templateScale);
+                using var bottom = LoadTemplate($"wechat_bottom_template{suffix}.png", templateScale);
+                if (top is null || bottom is null || top.Width >= frame.Width || bottom.Width >= frame.Width ||
+                    top.Height >= frame.Height || bottom.Height >= frame.Height) continue;
+                var topGray = ToGray(top, budget);
+                var bottomGray = ToGray(bottom, budget);
+                var topSearch = Task.Run(() => Find(frame, coarseFrame, topGray, topRegion, budget), ct);
+                var bottomSearch = Task.Run(() => Find(frame, coarseFrame, bottomGray, bottomRegion, budget), ct);
+                var matches = Task.WhenAll(topSearch, bottomSearch).GetAwaiter().GetResult();
+                var topMatch = matches[0];
+                var bottomMatch = matches[1];
+                if (topMatch is null || bottomMatch is null || topMatch.Bounds.Bottom + topMatch.Bounds.Height >= bottomMatch.Bounds.Top ||
+                    topMatch.Bounds.Right <= bottomMatch.Bounds.Left ||
+                    topMatch.Bounds.Left + topMatch.Bounds.Width / 2 <= bottomMatch.Bounds.Left) continue;
+                var anchors = new VisionAnchorHints
+                {
+                    TopToolbar = Normalize(topMatch.Bounds), BottomToolbar = Normalize(bottomMatch.Bounds),
+                    TopScore = topMatch.Score, BottomScore = bottomMatch.Score, Scale = templateScale
+                };
+                if (!accept(anchors)) continue;
+                budget.Check();
+                return (anchors, theme);
+            }
+            return null;
         }
         catch (Exception e) when (e is TimeoutException or ArgumentException or ExternalException or IOException)
         { return null; }
@@ -85,18 +106,21 @@ internal static class WechatTemplateLocator
 
     private static GrayImage ToGray(Bitmap bitmap, SearchBudget budget)
     {
-        using var copy = bitmap.Clone(new Rectangle(0, 0, bitmap.Width, bitmap.Height), PixelFormat.Format32bppArgb);
-        var data = copy.LockBits(new Rectangle(0, 0, copy.Width, copy.Height), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+        var width = bitmap.Width;
+        var height = bitmap.Height;
+        var bounds = new Rectangle(0, 0, width, height);
+        using var copy = bitmap.Clone(bounds, PixelFormat.Format32bppArgb);
+        var data = copy.LockBits(bounds, ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
         try
         {
-            var result = new byte[copy.Width * copy.Height]; var row = new byte[copy.Width * 4];
-            for (var y = 0; y < copy.Height; y++)
+            var result = new byte[width * height]; var row = new byte[width * 4];
+            for (var y = 0; y < height; y++)
             {
                 budget.Check(); Marshal.Copy(nint.Add(data.Scan0, y * data.Stride), row, 0, row.Length);
-                for (var x = 0; x < copy.Width; x++)
-                    result[y * copy.Width + x] = (byte)((29 * row[x * 4] + 150 * row[x * 4 + 1] + 77 * row[x * 4 + 2] + 128) >> 8);
+                for (var x = 0; x < width; x++)
+                    result[y * width + x] = (byte)((29 * row[x * 4] + 150 * row[x * 4 + 1] + 77 * row[x * 4 + 2] + 128) >> 8);
             }
-            return new(copy.Width, copy.Height, result);
+            return new(width, height, result);
         }
         finally { copy.UnlockBits(data); }
     }

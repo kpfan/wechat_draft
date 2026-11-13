@@ -5,7 +5,7 @@ namespace WechatDraft.Windows;
 
 // Classify interruption without retaining key codes, typed text, or an input history.
 internal sealed class VisionInteractionState(bool stopOnWheel = true, bool stopOnClick = true, bool stopOnKeyboard = true,
-    TimeProvider? timeProvider = null)
+    TimeProvider? timeProvider = null, bool trackWheelActivity = true)
 {
     private readonly TimeProvider _time = timeProvider ?? TimeProvider.System;
     private long _lastActivityTimestamp = (timeProvider ?? TimeProvider.System).GetTimestamp();
@@ -54,9 +54,10 @@ internal sealed class VisionInteractionState(bool stopOnWheel = true, bool stopO
         }
         else if (message is 0x20A or 0x20E)
         {
+            Interlocked.Exchange(ref _wheelObserved, 1);
+            if (!stopOnWheel && !trackWheelActivity) return;
             Interlocked.Exchange(ref _lastActivityTimestamp, _time.GetTimestamp());
             Volatile.Write(ref _lastActivity, (int)Cause.MouseWheel);
-            Interlocked.Exchange(ref _wheelObserved, 1);
             Interlocked.Increment(ref _activityVersion);
             if (stopOnWheel) Set(Cause.MouseWheel);
         }

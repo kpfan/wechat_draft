@@ -5,7 +5,11 @@ using System.Threading.Tasks;
 
 namespace WechatDraft.Windows;
 
-internal sealed record ClipboardDraftRead(bool ClipboardUpdated, string Text, int Attempts = 1, double ElapsedMs = 0);
+internal sealed record ClipboardDraftRead(bool ClipboardUpdated, string Text, int Attempts = 1, double ElapsedMs = 0)
+{
+    public bool ConfirmsSuffix(string greeting) =>
+        ClipboardUpdated && greeting.Length > 0 && Text.EndsWith(greeting, StringComparison.Ordinal);
+}
 
 internal static class VisionClipboardPoller
 {

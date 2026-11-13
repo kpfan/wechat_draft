@@ -31,7 +31,7 @@ internal static class VisionInputSettler
             var remaining = limit - timer.Elapsed;
             if (remaining <= TimeSpan.Zero) throw new InvalidOperationException(changedFrom is null
                 ? "等待微信收起选区并稳定输入画面超时，未继续预填。"
-                : "尚未确认微信完成粘贴，未发起读回或重复写入。请检查微信。");
+                : "尚未确认微信完成填写，未发起读回或重复写入。请检查微信。");
             previous = current;
             var pause = interval ?? TimeSpan.FromMilliseconds(10);
             await Task.Delay(pause < remaining ? pause : remaining, ct);

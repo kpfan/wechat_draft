@@ -18,15 +18,14 @@ public sealed partial class MainWindow : Window
     private readonly TaskCoordinator _coordinator;
     private readonly ContentControl _page = new() { HorizontalContentAlignment = HorizontalAlignment.Stretch, VerticalContentAlignment = VerticalAlignment.Stretch };
     private HistoryPageView? _historyView;
-    private readonly TextBlock _footer = Ui.Text("Ctrl + Alt + B", 12, "71817B");
+    private readonly TextBlock _footer = Ui.Text("", 12, "71817B");
     private readonly List<Button> _navigation = [];
     private AppSettings _settings;
     private GlobalHotkey? _hotkey;
+    private Action<HotkeyShortcut?>? _finishHotkeyRecording;
     private CancellationTokenSource? _runCancellation;
     private TaskRecord? _latest;
     private readonly Grid _root;
-    private TextBox? _demoInput;
-    private ComboBox? _demoName;
     private TextBlock? _resultText;
     private TextBlock? _resultStatus;
     private TextBlock? _progressTitle;
@@ -34,6 +33,7 @@ public sealed partial class MainWindow : Window
     private ProgressBar? _progressBar;
     private InfoBar? _notice;
     private Button? _startButton;
+    private Button? _forceGenerateButton;
     private Button? _cancelButton;
     private Button? _checkWechatButton;
     private Button? _checkVisionButton;
@@ -42,13 +42,9 @@ public sealed partial class MainWindow : Window
     private Image? _visionPreview;
     private Border? _visionPreviewCard;
     private ComboBox? _scene;
+    private ComboBox? _zodiac;
     private TextBox? _extra;
-    private ToggleSwitch? _mode;
     private ComboBox? _windows;
-    private List<Contact> _demoContacts = [];
-    private string _demoDraft = "";
-    private int _demoIndex;
-    private long _demoRevision;
     private System.Windows.Forms.NotifyIcon? _tray;
     private bool _paused;
     private bool _homeVisible;
@@ -59,11 +55,11 @@ public sealed partial class MainWindow : Window
         _dataDirectory = Environment.GetEnvironmentVariable("WECHAT_DRAFT_DATA") ?? Path.Combine(AppContext.BaseDirectory, "data");
         _repository = new LocalRepository(_dataDirectory, _protector);
         _settings = _repository.LoadSettings();
+        var packageWarning = LoadPackagedDefault();
         _repository.RecoverInterrupted(); _repository.Cleanup(_settings.RetentionDays);
         var bundled = Path.Combine(AppContext.BaseDirectory, "config", "blessing_examples.json");
         _examples.Load(bundled);
         if (!string.IsNullOrWhiteSpace(_settings.ExamplesPath)) _examples.TryReload(_settings.ExamplesPath);
-        SeedDemoContacts();
         _coordinator = new TaskCoordinator(_repository, _examples, _protector);
         _coordinator.Progress += progress => DispatcherQueue.TryEnqueue(() =>
         {
@@ -76,29 +72,32 @@ public sealed partial class MainWindow : Window
         Content = _root;
         ConfigureWindowLayout();
         ShowHome();
+        if (packageWarning is not null) Notify(packageWarning, InfoBarSeverity.Warning);
         var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
         _hotkey = new GlobalHotkey(hwnd);
-        _hotkey.Pressed += () => DispatcherQueue.TryEnqueue(() => { if (!_paused) _ = StartTaskAsync(); });
-        if (!_hotkey.Register(_settings.HotkeyVirtualKey)) _footer.Text = "快捷键冲突，请到设置修改";
+        _hotkey.Pressed += () =>
+        {
+            var recording = _finishHotkeyRecording;
+            var shortcut = _settings.GenerationHotkey;
+            DispatcherQueue.TryEnqueue(() =>
+            {
+                if (recording is not null)
+                {
+                    if (_finishHotkeyRecording == recording) recording(shortcut);
+                }
+                else if (_finishHotkeyRecording is null && !_paused)
+                    _ = StartTaskAsync();
+            });
+        };
+        Activated += (_, args) =>
+        {
+            if (args.WindowActivationState == WindowActivationState.Deactivated) _finishHotkeyRecording?.Invoke(null);
+        };
+        _hotkey.Register(_settings.GenerationHotkey);
+        UpdateHotkeyFooter();
         SetupTray();
         ConfigureWindowRefresh();
-        Closed += async (_, _) =>
-        {
-            _historyView?.Dispose(); _runCancellation?.Cancel(); CloseSentRecording();
-            _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose();
-            try { await ReleaseThirdRunAsync(); } finally { _thirdService?.Dispose(); }
-        };
-    }
-
-    private void SeedDemoContacts()
-    {
-        _demoContacts = _repository.Contacts(_settings.AccountScope).Where(x => x.IsDemo && x.Confirmed).ToList();
-        if (_demoContacts.Count > 0) return;
-        foreach (var contact in new[]
-        {
-            new Contact { DisplayName = "陈老师", RemarkName = "陈老师", Relationship = "teacher", AddressTerm = "陈老师", Confirmed = true, IsDemo = true, BindingStatus = "demo", AccountScope = _settings.AccountScope },
-            new Contact { DisplayName = "小林", RemarkName = "小林", Relationship = "friend", AddressTerm = "小林", Confirmed = true, IsDemo = true, BindingStatus = "demo", AccountScope = _settings.AccountScope }
-        }) { _repository.SaveContact(contact); _demoContacts.Add(contact); }
+        Closed += async (_, _) => { _historyView?.Dispose(); _runCancellation?.Cancel(); await ReleaseThirdRunAsync(); _thirdService?.Dispose(); CloseSentRecording(); _hotkey?.Dispose(); _tray?.Dispose(); _client.Dispose(); };
     }
 
     private Border BuildSidebar()
@@ -174,140 +173,106 @@ public sealed partial class MainWindow : Window
             _page.Content = _runningHomeView;
             return;
         }
-        _windows = null;
-        _prefill = null; _prefillHelp = null;
         var header = Ui.Stack(8, Ui.Badge("为每一份关系，留一点用心"), Ui.Text("一句祝福，刚刚好。", 30, bold: true),
             Ui.Text("选好场景，打开聊天，让合适的心意落在输入框里。", 14, "73817A"));
-        _mode = new ToggleSwitch { Header = "当前工作模式", OffContent = "真实微信", OnContent = "演示模式 · 无 API 调用", IsOn = _settings.DemoMode };
-        _mode.Toggled += async (_, _) =>
-        {
-            if (IsTaskBusy) return;
-            StopSentRecording();
-            _settings.DemoMode = _mode.IsOn; _repository.SaveSettings(_settings);
-            await ReleaseThirdRunAsync(); ShowHome();
-        };
+        _windows = new ComboBox { Header = "目标微信窗口", HorizontalAlignment = HorizontalAlignment.Stretch };
+        TrackWindowChoice(_windows);
+        RefreshWindows();
+        _checkWechatButton = Ui.Button("检查 UIA 输入框", () => _ = CheckWechatAsync());
+        _checkVisionButton = Ui.Button("检查视觉定位", () => _ = CheckVisionAsync());
+        var target = Ui.Stack(8, _windows, Ui.Row(8, _checkWechatButton, _checkVisionButton),
+            Ui.Badge(AutomationLabel(_settings.AutomationMode)));
         _scene = Ui.Combo("祝福场景", ["春节", "元旦", "中秋", "端午", "生日", "纪念日", "通用问候"], _settings.Scene);
         _scene.IsEditable = true; _scene.Text = _settings.Scene;
-        _extra = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：给老师，朴素一点；加 1–2 个 Emoji"); _extra.MaxLength = 300;
-        _extra.AcceptsReturn = true; _extra.Height = 86;
-        _startButton = Ui.Button(_settings.DemoMode ? "✦  生成并预填草稿" : "✦  生成三个祝福候选", () => _ = StartTaskAsync(), true);
+        _zodiac = BuildZodiacSelector(_scene);
+        var extraEditor = BuildExtraInstructionEditor();
+        _startButton = Ui.Button("✦  生成三个祝福候选", () => _ = StartTaskAsync(), true);
         _startButton.HorizontalAlignment = HorizontalAlignment.Stretch;
         _cancelButton = Ui.Button("取消任务", () => _runCancellation?.Cancel()); _cancelButton.IsEnabled = false;
         _progressTitle = Ui.Text("准备就绪", 13, "416A56", true);
-        _progressDetail = Ui.Text(_settings.DemoMode ? "先体验完整流程，随后在设置中连接你的模型。" : "先配置 API 并选择目标微信窗口。", 12, "7C8981");
+        _progressDetail = Ui.Text("先配置 API 并选择目标微信窗口。", 12, "7C8981");
         _progressBar = new ProgressBar { Minimum = 0, Maximum = 100, Value = 0, Height = 4, Foreground = Ui.Brush("258260") };
-        var form = Ui.Stack(14, Ui.Text("生成一条合适的祝福", 19, bold: true), _mode,
-            _scene, _extra, Columns(_startButton, _cancelButton, 3, 1),
+        _forceGenerateButton = Ui.Button("强制生成", () => _ = StartTaskAsync(forceGeneration: true));
+        var form = Ui.Stack(14, Ui.Text("生成一条合适的祝福", 19, bold: true), target,
+            _scene, _zodiac, extraEditor, BuildPrefillOption(), Columns(_startButton, _cancelButton, 3, 1),
+            Ui.Stack(6, _forceGenerateButton, Ui.Text("跳过本地会话核对并生成三个候选。未核对身份的结果仅供复制，不自动预填；模型仍遵守第三版称呼与单聊规则。", 12, "8D713D")),
             Ui.Stack(7, _progressTitle, _progressDetail, _progressBar));
-        if (!_settings.DemoMode)
-        {
-            _windows = new ComboBox { Header = "目标微信窗口", HorizontalAlignment = HorizontalAlignment.Stretch };
-            TrackWindowChoice(_windows);
-            RefreshWindows();
-            _checkWechatButton = Ui.Button("检查 UIA 输入框", () => _ = CheckWechatAsync());
-            _checkVisionButton = Ui.Button("检查视觉定位", () => _ = CheckVisionAsync());
-            form.Children.Insert(2, Ui.Stack(8, _windows, Ui.Row(8, _checkWechatButton, _checkVisionButton),
-                Ui.Badge(AutomationLabel(_settings.AutomationMode))));
-            form.Children.Insert(form.Children.Count - 2, BuildPrefillOption());
-        }
         _resultText = Ui.Text(_latest?.Greeting is { Length: > 0 } result ? result : "生成后，祝福正文会显示在这里。", 16, "385347");
         _resultText.IsTextSelectionEnabled = true; _resultText.LineHeight = 29;
         var resultBadge = Ui.Badge(_latest?.FillStatus ?? "等待生成"); _resultStatus = (TextBlock)resultBadge.Child;
         var resultCard = Ui.Card(Ui.Stack(14, Ui.Row(10, Ui.Text("本次祝福", 17, bold: true), resultBadge),
             _resultText, Ui.Button("复制正文", () => CopyText(_latest?.Greeting ?? "")), Ui.Text("结果会自动保存在历史记录中。", 11, "8B958E")), "F0F7F1", 22);
-        _visionPreview = null; _visionPreviewCard = null;
-        UIElement body;
-        if (_settings.DemoMode)
-            body = Columns(Ui.Stack(18, Ui.Card(form), resultCard), BuildDemoChat());
-        else
-        {
-            _visionPreview = new Image { Stretch = Stretch.Uniform, MaxHeight = 440 };
-            _visionPreviewCard = Ui.Card(Ui.Stack(12,
-                Ui.Row(12, Ui.Text("视觉定位预览", 17, bold: true), Ui.Button("收起预览", () =>
-                { if (_visionPreviewCard is not null) _visionPreviewCard.Visibility = Visibility.Collapsed; })),
-                _visionPreview,
-                Ui.Text("黄框：本地图标；蓝框：聊天与标题；绿框：消息；紫框：输入面板；橙框：编辑区估算；红框：发送区域估算。仅预览，不点击或填写。", 12, "71817B")));
-            _visionPreviewCard.Visibility = Visibility.Collapsed;
-            body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, BuildThirdVersionResult(), BuildSentRecordingControls());
-        }
+        _visionPreview = new Image { Stretch = Stretch.Uniform, MaxHeight = 440 };
+        _visionPreviewCard = Ui.Card(Ui.Stack(12,
+            Ui.Row(12, Ui.Text("视觉定位预览", 17, bold: true), Ui.Button("收起预览", () =>
+            { if (_visionPreviewCard is not null) _visionPreviewCard.Visibility = Visibility.Collapsed; })),
+            _visionPreview,
+            Ui.Text("黄框：本地图标；蓝框：聊天与标题；绿框：消息；紫框：输入面板；橙框：编辑区估算；红框：发送区域估算。仅预览，不点击或填写。", 12, "71817B")));
+        _visionPreviewCard.Visibility = Visibility.Collapsed;
+        var body = Ui.Stack(18, Ui.Card(form), _visionPreviewCard, BuildThirdVersionResult(), BuildSentRecordingControls());
         _notice = new InfoBar { IsOpen = false, IsClosable = true };
         _runningHomeView = Present(Ui.Stack(22, header, _notice, body));
         if (_lastTaskProgress is { } progress) ShowProgress(progress.Stage, progress.Detail, progress.Percent);
         if (_lastTaskNotice is { } notice) Notify(notice.Text, notice.Severity);
     }
 
-    private UIElement BuildDemoChat()
+    private StackPanel BuildExtraInstructionEditor()
     {
-        _demoName = new ComboBox { HorizontalAlignment = HorizontalAlignment.Stretch, MinWidth = 160 };
-        foreach (var contact in _demoContacts) _demoName.Items.Add(contact.DisplayName);
-        _demoName.SelectedIndex = Math.Clamp(_demoIndex, 0, _demoContacts.Count - 1);
-        _demoName.SelectionChanged += (_, _) => { _demoIndex = Math.Max(0, _demoName.SelectedIndex); _demoRevision++; };
-        _demoInput = new TextBox { Text = _demoDraft, AcceptsReturn = true, TextWrapping = TextWrapping.Wrap,
-            PlaceholderText = "可先输入内容，体验保留原文并另起一行追加。", Height = 154, BorderThickness = new Thickness(0), Background = Ui.Brush("FFFFFF") };
-        _demoInput.TextChanged += (_, _) => { _demoDraft = _demoInput.Text; _demoRevision++; };
-        var otherBubble = Ui.Card(Ui.Text("最近一切都好，祝你也顺顺利利。", 13, "405049"), "FFFFFF", 14);
-        otherBubble.HorizontalAlignment = HorizontalAlignment.Left; otherBubble.MaxWidth = 260;
-        var ownBubble = Ui.Card(Ui.Text("谢谢，您也多保重！", 13, "2D5040"), "D9EEDB", 14);
-        ownBubble.HorizontalAlignment = HorizontalAlignment.Right; ownBubble.MaxWidth = 230;
-        var conversation = Ui.Stack(20, Ui.Text("以下为虚构聊天，仅用于演示", 11, "9AA59F"), otherBubble, ownBubble,
-            Ui.Text("试试生成一条祝福 ↓", 12, "93A399"));
-        conversation.MinHeight = 236;
-        var title = Ui.Stack(10, Ui.Row(10, Ui.Badge("演示聊天"), Ui.Badge("不会发送", "748278", "F0F2EF")), _demoName);
-        var panel = Ui.Stack(0, Ui.Card(title, "FFFFFF", 18), Ui.Card(conversation, "F2F4F1", 18),
-            Ui.Card(Ui.Stack(8, Ui.Text("草稿输入框", 12, "809087"), _demoInput,
-                Ui.Row(8, Ui.Button("插入已有草稿", () => _demoInput.Text = "稍后再和您联系。"), Ui.Button("清空", () => _demoInput.Text = "")),
-                Ui.Button("模拟发送并归档", SimulateSentGreeting)), "FFFFFF", 16),
-            Ui.Text("你可以在生成期间修改草稿，观察系统停止追加。", 11, "8B9990"));
-        return panel;
+        const int maxLength = 300;
+        var editor = Ui.Input("当次补充要求", _settings.ExtraInstruction, "例如：语气亲切一点，带上称呼，加 1–2 个表情");
+        editor.MaxLength = maxLength;
+        editor.AcceptsReturn = true;
+        editor.TextWrapping = TextWrapping.Wrap;
+        editor.MinHeight = 112;
+        editor.MaxHeight = 232;
+        ScrollViewer.SetHorizontalScrollBarVisibility(editor, ScrollBarVisibility.Disabled);
+        ScrollViewer.SetVerticalScrollBarVisibility(editor, ScrollBarVisibility.Auto);
+        ScrollViewer.SetVerticalScrollMode(editor, ScrollMode.Enabled);
+        _extra = editor;
+
+        var count = Ui.Text($"{editor.Text.Length} / {maxLength}", 12, "73817A");
+        count.HorizontalAlignment = HorizontalAlignment.Right;
+        editor.TextChanged += (_, _) => count.Text = $"{editor.Text.Length} / {maxLength}";
+        return Ui.Stack(5, editor, count);
     }
 
-    private async Task StartTaskAsync()
+    private ComboBox BuildZodiacSelector(ComboBox scene)
+    {
+        var zodiac = Ui.Combo("生肖年", HolidayZodiac.Years, HolidayZodiac.ResolveYear(_settings.ZodiacYear));
+        void UpdateVisibility(string sceneName) =>
+            zodiac.Visibility = HolidayZodiac.AppliesTo(sceneName) ? Visibility.Visible : Visibility.Collapsed;
+
+        UpdateVisibility(scene.Text);
+        scene.SelectionChanged += (_, args) => UpdateVisibility(args.AddedItems.FirstOrDefault() as string ?? scene.Text);
+        scene.TextSubmitted += (_, args) => UpdateVisibility(args.Text);
+        zodiac.SelectionChanged += (_, _) =>
+        {
+            if (zodiac.SelectedItem is not string selected) return;
+            var previous = HolidayZodiac.ResolveYear(_settings.ZodiacYear);
+            if (selected == previous) return;
+            var next = _settings with { ZodiacYear = selected };
+            try { _repository.SaveSettings(next); _settings = next; }
+            catch (Exception e)
+            {
+                zodiac.SelectedItem = previous;
+                Notify("生肖年未保存：" + e.Message, InfoBarSeverity.Warning);
+            }
+        };
+        return zodiac;
+    }
+
+    private async Task StartTaskAsync(bool forceGeneration = false)
     {
         if (IsTaskBusy) { Notify("当前任务正在进行，请稍候。", InfoBarSeverity.Informational); return; }
         if (!_homeVisible || _scene is null) ShowHome();
         _settings.Scene = _scene!.Text.Trim();
         _settings.ExtraInstruction = _extra?.Text.Trim() ?? "";
         _repository.SaveSettings(_settings);
+        RefreshWindows();
+        if (_windows?.SelectedItem is not WechatWindow window) { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
+        if (!await ConfirmScreenshotUploadAsync() || IsTaskBusy) return;
         var taskSettings = _settings with { };
-        IConversationAdapter adapter;
-        Contact? contact = null;
-        if (taskSettings.DemoMode)
-        {
-            if (_demoInput is null) ShowHome();
-            contact = _demoContacts[Math.Clamp(_demoIndex, 0, _demoContacts.Count - 1)] with { };
-            var input = _demoInput!; var name = _demoName!;
-            adapter = new DemoConversationAdapter(() => input.Text, text => input.Text = text,
-                () => name.SelectedItem?.ToString() ?? "演示联系人", () => _demoRevision);
-        }
-        else
-        {
-            RefreshWindows();
-            if (_windows?.SelectedItem is not WechatWindow window) { Notify("请打开微信并选择目标窗口，列表会自动更新。", InfoBarSeverity.Warning); return; }
-            await StartThirdVersionTaskAsync(taskSettings, window);
-            return;
-        }
-        _runCancellation = new CancellationTokenSource(); SetBusy(true);
-        try
-        {
-            var result = await _coordinator.RunAsync(taskSettings, adapter,
-                taskSettings.DemoMode ? new DemoGreetingModel() : _client, contact, _runCancellation.Token);
-            if (result is null) return; _latest = result;
-            if (_resultText is not null) _resultText.Text = string.IsNullOrWhiteSpace(result.Greeting) ? "本次没有生成正文。" : result.Greeting;
-            if (_resultStatus is not null) _resultStatus.Text = result.FillStatus;
-            var detail = result.Error.Length > 0 ? result.Error : "请检查草稿并手动发送。";
-            Notify(result.FillStatus + " · " + detail, result.FillStatus is "已预填" or "演示预填" ? InfoBarSeverity.Success : InfoBarSeverity.Warning);
-            _tray!.Text = "祝语 · " + taskSettings.Scene;
-        }
-        catch (Exception e)
-        {
-            ShowProgress("处理失败", e.Message, 100);
-            Notify("处理未完成：" + e.Message, InfoBarSeverity.Error);
-        }
-        finally
-        {
-            if (adapter is IDisposable disposable) disposable.Dispose();
-            _runCancellation?.Dispose(); _runCancellation = null; SetBusy(false);
-        }
+        await StartThirdVersionTaskAsync(taskSettings, window, forceGeneration);
     }
 
     private async Task CheckWechatAsync()
@@ -348,9 +313,10 @@ public sealed partial class MainWindow : Window
             progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent)));
         return settings.AutomationMode == "uia" ? uia : new FallbackConversationAdapter(uia, () => CreateVisionAdapter(target, settings.EnableLiveAppend));
     }
-    private WechatVisionAdapter CreateVisionAdapter(nint target, bool enableAppend = false) => new(target,
+    private WechatVisionAdapter CreateVisionAdapter(nint target, bool enableAppend = false, bool forceGeneration = false) => new(target,
         progress => DispatcherQueue.TryEnqueue(() => ShowProgress(progress.Stage, progress.Detail, progress.Percent)), enableAppend,
-        clipboardOwner: WinRT.Interop.WindowNative.GetWindowHandle(this), companion: WinRT.Interop.WindowNative.GetWindowHandle(this));
+        clipboardOwner: WinRT.Interop.WindowNative.GetWindowHandle(this), companion: WinRT.Interop.WindowNative.GetWindowHandle(this),
+        forceGeneration: forceGeneration);
 
     private async Task CheckVisionAsync()
     {
@@ -408,18 +374,17 @@ public sealed partial class MainWindow : Window
             ShowProgress("准备任务", "正在准备本次任务", 0);
         }
         if (_startButton is not null) _startButton.IsEnabled = !busy;
+        if (_forceGenerateButton is not null) _forceGenerateButton.IsEnabled = !busy;
         if (_cancelButton is not null) _cancelButton.IsEnabled = busy;
         if (_checkWechatButton is not null) _checkWechatButton.IsEnabled = !busy;
         if (_checkVisionButton is not null) _checkVisionButton.IsEnabled = !busy;
         if (_prefill is not null) _prefill.IsEnabled = !busy;
         if (_windows is not null) _windows.IsEnabled = !busy;
-        if (_mode is not null) _mode.IsEnabled = !busy;
+        if (_zodiac is not null) _zodiac.IsEnabled = !busy;
         foreach (var button in _idleActions) button.IsEnabled = !busy;
         _historyView?.SetTaskBusy(busy);
         if (!busy) _taskFinishedElsewhere = !_homeVisible;
         RefreshSidebarTask();
-        ThirdSetBusy(busy);
-        if (!busy) ThirdRenderHome();
         if (!busy)
         {
             var refreshHome = _homeVisible && _homeSettingsAtTaskStart is not null && _homeSettingsAtTaskStart != _settings;
@@ -450,9 +415,19 @@ public sealed partial class MainWindow : Window
         var menu = new System.Windows.Forms.ContextMenuStrip();
         menu.Items.Add("打开祝语", null, (_, _) => DispatcherQueue.TryEnqueue(Activate));
         menu.Items.Add("暂停 / 恢复快捷键", null, (_, _) => DispatcherQueue.TryEnqueue(() =>
-        { _paused = !_paused; if (_paused) _hotkey?.Pause(); else _hotkey?.Register(_settings.HotkeyVirtualKey); _footer.Text = _paused ? "快捷键已暂停" : "Ctrl + Alt + " + (char)_settings.HotkeyVirtualKey; }));
+        {
+            _paused = !_paused;
+            if (_paused) _hotkey?.Pause();
+            else _hotkey?.Register(_settings.GenerationHotkey);
+            UpdateHotkeyFooter();
+        }));
         menu.Items.Add("退出", null, (_, _) => DispatcherQueue.TryEnqueue(Close));
         _tray.ContextMenuStrip = menu; _tray.DoubleClick += (_, _) => DispatcherQueue.TryEnqueue(Activate);
+    }
+    private void UpdateHotkeyFooter()
+    {
+        _footer.Text = _paused ? "快捷键已暂停" :
+            _hotkey?.IsRegistered == true ? _settings.GenerationHotkey.ToString() : "快捷键不可用，请到设置修改";
     }
     private async Task<bool> ConfirmAsync(string title, string message)
     {
